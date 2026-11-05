@@ -72,13 +72,22 @@ const charImgs = [];
 let ambientImg;
 let imgReady = false;
 
-// The 3 tree holes (normalized to the SVG viewBox 3114.41 x 1602.18) that the
-// muñecos pop out of: 2 on the right side, 1 on the left.
+// The tree holes (normalized to the SVG viewBox 2573.89 x 1562.94) that the
+// muñecos pop out of: 2 left, 1 right-upper, and 2 at the bottom (new).
 const MUNECO_HOLES = [
-  { x: 0.094, y: 0.378 }, // left
-  { x: 0.869, y: 0.36 },  // right (upper)
-  { x: 0.919, y: 0.549 }, // right (lower)
+  { x: 0.022, y: 0.371 }, // left-upper
+  { x: 0.084, y: 0.552 }, // left-lower
+  { x: 0.963, y: 0.356 }, // right-upper
+  { x: 0.294, y: 0.784 }, // bottom-left (new)
+  { x: 0.666, y: 0.83 },  // bottom-right (new)
 ];
+
+// Rotation for a hole based on its side: left = +90°, right = -90°, bottom = 0°.
+function holeRotation(x) {
+  if (x < 0.2) return HALF_PI; // left side, clockwise
+  if (x > 0.8) return -HALF_PI; // right side, counterclockwise
+  return 0; // bottom, head up
+}
 
 function setup() {
   const cnv = createCanvas(windowWidth, windowHeight);
@@ -432,7 +441,7 @@ function spawnMuneco() {
     type: Math.floor(random(CHAR_FILES.length)), // random character
     hole,
     h,
-    rotation: spawn.x < 0.5 ? HALF_PI : -HALF_PI, // left: +90°, right: -90°
+    rotation: holeRotation(spawn.x),
     startX,
     startY,
     targetX: startX + (dx / len) * popDist,
