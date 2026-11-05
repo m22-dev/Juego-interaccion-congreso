@@ -61,6 +61,19 @@ class Smooth {
 const bodySmooth = new Smooth(0.5);
 const handSmoothers = {}; // one smoother per hand (keyed by side + handedness)
 
+// Placeholder "muñecos" that pop out from the screen edges (later they'll come
+// from the nature-frame holes). Spawn rate is random and drifts over time;
+// each one stays visible for at least 1 second.
+let munecos = [];
+let nextSpawnAt = 0;
+const MUNECO_COLORS = [
+  [110, 180, 90],
+  [220, 150, 70],
+  [200, 100, 80],
+  [90, 160, 170],
+  [230, 180, 60],
+];
+
 function setup() {
   const cnv = createCanvas(windowWidth, windowHeight);
   cnv.parent("app");
@@ -69,6 +82,8 @@ function setup() {
   handPose = ml5.handPose({ maxHands: 4 }, onHandPoseReady);
 
   initCamera();
+
+  nextSpawnAt = millis() + randomSpawnDelay();
 
   // Diagnostics: warn if a model never becomes ready (network/CORS issue).
   window.setTimeout(() => {
@@ -193,6 +208,10 @@ function draw() {
 
   if (videoReady && bodyStarted) drawBodies();
   if (videoReady && handStarted) drawHands();
+
+  updateMunecos();
+  drawMunecos();
+
   if (videoReady) drawDivider();
 
   drawStatusDot();
@@ -327,6 +346,101 @@ function gestureColor(label) {
   if (label === "PUÑO") return [255, 59, 78]; // red
   if (label === "MANO ABIERTA") return [46, 224, 106]; // green
   return [255, 176, 32]; // amber
+}
+
+// --- Muñecos (placeholder characters spawning from the screen edges) ------
+//
+// For now these are simple colored blobs; later they'll come out of the
+// nature-frame holes along the border.
+
+function updateMunecos() {
+  const now = millis();
+  if (now >= nextSpawnAt) {
+    spawnMuneco();
+    nextSpawnAt = now + randomSpawnDelay();
+  }
+  for (let i = munecos.length - 1; i >= 0; i--) {
+    const m = munecos[i];
+    m.age = now - m.bornAt;
+    if (m.age >= m.lifetime) munecos.splice(i, 1);
+  }
+}
+
+function randomSpawnDelay() {
+  // Random interval whose range drifts over time, so the pace varies.
+  const t = millis() / 1000;
+  const drift = 0.5 + 0.5 * Math.sin(t / 6); // 0..1 oscillation (~37s)
+  const lo = lerp(500, 1800, drift);
+  return random(lo, lo + 1500);
+}
+
+function spawnMuneco() {
+  const r = random(16, 26);
+  const inset = r + 34; // how far inward it pops from the edge
+  let startX, startY, targetX, targetY;
+
+  switch (Math.floor(random(4))) {
+    case 0: // top
+      startX = random(width); startY = -r; targetX = startX; targetY = inset;
+      break;
+    case 1: // bottom
+      startX = random(width); startY = height + r; targetX = startX; targetY = height - inset;
+      break;
+    case 2: // left
+      startX = -r; startY = random(height); targetX = inset; targetY = startY;
+      break;
+    default: // right
+      startX = width + r; startY = random(height); targetX = width - inset; targetY = startY;
+      break;
+  }
+
+  munecos.push({
+    startX, startY, targetX, targetY,
+    r,
+    col: MUNECO_COLORS[Math.floor(random(MUNECO_COLORS.length))],
+    bornAt: millis(),
+    lifetime: random(1000, 3500), // minimum 1 second
+    popDuration: 280,
+    age: 0,
+  });
+}
+
+function drawMunecos() {
+  for (const m of munecos) drawMuneco(m);
+}
+
+function drawMuneco(m) {
+  const pop = easeOutBack(constrain(m.age / m.popDuration, 0, 1));
+  const x = lerp(m.startX, m.targetX, pop);
+  const y = lerp(m.startY, m.targetY, pop);
+
+  let alpha = 255;
+  if (m.age > m.lifetime - 250) {
+    alpha = map(m.age, m.lifetime - 250, m.lifetime, 255, 0);
+  }
+
+  const [cr, cg, cb] = m.col;
+  const r = m.r;
+  noStroke();
+
+  // Body.
+  fill(cr, cg, cb, alpha);
+  circle(x, y, r * 2);
+
+  // Face highlight.
+  fill(255, 255, 255, alpha * 0.35);
+  circle(x - r * 0.22, y - r * 0.3, r * 0.55);
+
+  // Eyes.
+  fill(45, 32, 24, alpha);
+  circle(x - r * 0.28, y - r * 0.12, r * 0.22);
+  circle(x + r * 0.28, y - r * 0.12, r * 0.22);
+}
+
+function easeOutBack(t) {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
 }
 
 // --- Helpers --------------------------------------------------------------
