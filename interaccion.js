@@ -23,7 +23,8 @@ let handConnections = [];
 let videoReady = false;
 let bodyReady = false;
 let handReady = false;
-let started = false;
+let bodyStarted = false;
+let handStarted = false;
 
 let mirror = true; // natural "mirror" view
 
@@ -39,17 +40,22 @@ let coverOffX = 0;
 let coverOffY = 0;
 
 const bodySmooth = new Smooth(0.5);
-const handSmoothers = {}; // one smoother per hand (keyed by handedness)
+const handSmoothers = {}; // one smoother per hand (keyed by side + handedness)
 
 function setup() {
   const cnv = createCanvas(windowWidth, windowHeight);
   cnv.parent("app");
 
-  // MultiPose tracks several people at once (capped to the first two on draw).
   bodyPose = ml5.bodyPose("MoveNet", { modelType: "MultiPose.Lightning" }, onBodyPoseReady);
   handPose = ml5.handPose({ maxHands: 4 }, onHandPoseReady);
 
   initCamera();
+
+  // Diagnostics: warn if a model never becomes ready (network/CORS issue).
+  window.setTimeout(() => {
+    if (!bodyReady) console.warn("[tracker] bodyPose no cargó en 15s (¿red/TFHub bloqueado?)");
+    if (!handReady) console.warn("[tracker] handPose no cargó en 15s (¿red/CDN bloqueado?)");
+  }, 15000);
 }
 
 function windowResized() {
@@ -60,11 +66,8 @@ function windowResized() {
 // --- Camera ---------------------------------------------------------------
 
 function initCamera() {
-  if (started) {
-    bodyPose.detectStop();
-    handPose.detectStop();
-    started = false;
-  }
+  if (bodyStarted) { bodyPose.detectStop(); bodyStarted = false; }
+  if (handStarted) { handPose.detectStop(); handStarted = false; }
   videoReady = false;
   if (video) {
     if (video.elt && video.elt.srcObject) {
@@ -94,33 +97,43 @@ function updateCoverTransform() {
   }
 }
 
-// --- Readiness ------------------------------------------------------------
+// --- Readiness (body and hand start independently) ------------------------
 
 function onVideoReady() {
   videoW = video.elt.videoWidth || CAM_W;
   videoH = video.elt.videoHeight || CAM_H;
   updateCoverTransform();
   videoReady = true;
-  tryStart();
+  tryStartBody();
+  tryStartHand();
 }
 
 function onBodyPoseReady() {
   bodyReady = true;
-  tryStart();
+  console.log("[tracker] bodyPose listo");
+  tryStartBody();
 }
 
 function onHandPoseReady() {
   handReady = true;
-  tryStart();
+  console.log("[tracker] handPose listo");
+  tryStartHand();
 }
 
-function tryStart() {
-  if (started || !videoReady || !bodyReady || !handReady) return;
-  started = true;
+function tryStartBody() {
+  if (bodyStarted || !videoReady || !bodyReady) return;
+  bodyStarted = true;
   bodyPose.detectStart(video, gotPoses);
-  handPose.detectStart(video, gotHands);
   bodyConnections = bodyPose.getConnections() || [];
+  console.log("[tracker] bodyPose detectStart iniciado");
+}
+
+function tryStartHand() {
+  if (handStarted || !videoReady || !handReady) return;
+  handStarted = true;
+  handPose.detectStart(video, gotHands);
   handConnections = handPose.getConnections() || [];
+  console.log("[tracker] handPose detectStart iniciado");
 }
 
 function gotPoses(results) {
@@ -159,11 +172,11 @@ function draw() {
     pop();
   }
 
-  if (started && videoReady) {
-    drawBodies();
-    drawHands();
-    drawDivider();
-  }
+  if (videoReady && bodyStarted) drawBodies();
+  if (videoReady && handStarted) drawHands();
+  if (videoReady) drawDivider();
+
+  drawStatusDot();
 }
 
 // --- Body (subtle skeleton, up to 2 people) -------------------------------
@@ -181,33 +194,41 @@ function drawPose(pose, index) {
   }
 
   // Subtle full-body skeleton.
-  stroke(255, 255, 255, 70);
-  strokeWeight(1.5);
+  stroke(255, 255, 255, 110);
+  strokeWeight(2);
   for (const [a, b] of bodyConnections) {
     const pa = sm[a];
     const pb = sm[b];
-    if (pa && pb && pa.score > SCORE_THRESHOLD && pb.score > SCORE_THRESHOLD) {
+    if (pa && pb && kpConfidence(pa) > SCORE_THRESHOLD && kpConfidence(pb) > SCORE_THRESHOLD) {
       line(px(pa.x), pa.y, px(pb.x), pb.y);
     }
   }
 
   // Subtle joints.
   noStroke();
-  fill(255, 255, 255, 90);
+  fill(255, 255, 255, 130);
   for (const kp of sm) {
-    if (kp.score > SCORE_THRESHOLD) circle(px(kp.x), kp.y, 4);
+    if (kpConfidence(kp) > SCORE_THRESHOLD) circle(px(kp.x), kp.y, 5);
   }
 }
 
 // Subtle vertical divider at the center of the screen.
 function drawDivider() {
-  stroke(255, 255, 255, 70);
-  strokeWeight(1.5);
+  stroke(255, 255, 255, 110);
+  strokeWeight(2);
   const dash = 12;
   const gap = 16;
   for (let y = 0; y < height; y += dash + gap) {
     line(width / 2, y, width / 2, Math.min(y + dash, height));
   }
+}
+
+// Tiny non-textual status dot: green = tracking someone, amber = waiting.
+function drawStatusDot() {
+  noStroke();
+  if (poses.length > 0) fill(46, 224, 106, 200);
+  else fill(255, 176, 32, 200);
+  circle(14, 14, 8);
 }
 
 // --- Hands (fists) --------------------------------------------------------
@@ -236,7 +257,7 @@ function drawHand(hand) {
   const col = gestureColor(handGesture(byName).label);
 
   // Subtle skeleton lines.
-  stroke(col[0], col[1], col[2], 90);
+  stroke(col[0], col[1], col[2], 110);
   strokeWeight(1.2);
   for (const [a, b] of handConnections) {
     const pa = sm[a];
@@ -246,8 +267,8 @@ function drawHand(hand) {
 
   // Small landmarks.
   noStroke();
-  fill(col[0], col[1], col[2], 160);
-  for (const kp of sm) circle(px(kp.x), kp.y, 4);
+  fill(col[0], col[1], col[2], 180);
+  for (const kp of sm) circle(px(kp.x), kp.y, 5);
 }
 
 // Detects fist vs open hand by comparing fingertip-to-wrist distance against
@@ -294,6 +315,11 @@ function gestureColor(label) {
 // Maps a raw x coordinate into screen space, honoring mirror mode.
 function px(x) {
   return mirror ? width - x : x;
+}
+
+// ml5 renames keypoint `score` to `confidence`; read whichever is present.
+function kpConfidence(kp) {
+  return kp.confidence !== undefined ? kp.confidence : kp.score;
 }
 
 function handKey(hand) {
