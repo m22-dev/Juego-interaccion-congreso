@@ -61,9 +61,7 @@ class Smooth {
 const bodySmooth = new Smooth(0.5);
 const handSmoothers = {}; // one smoother per hand (keyed by side + handedness)
 
-// Placeholder "muñecos" that pop out from the screen edges (later they'll come
-// from the nature-frame holes). Spawn rate is random and drifts over time;
-// each one stays visible for at least 1 second.
+// Placeholder "muñecos" that pop out of the nature frame's holes.
 let munecos = [];
 let nextSpawnAt = 0;
 const MUNECO_COLORS = [
@@ -74,9 +72,39 @@ const MUNECO_COLORS = [
   [230, 180, 60],
 ];
 
+// Nature frame (the ambience image) drawn fullscreen over the camera. Its
+// transparent center shows the camera/players; muñecos spawn from its inner
+// edge (the "holes").
+let ambientImg;
+let imgReady = false;
+let imgW = 2560;
+let imgH = 1540;
+let imgScale = 1;
+let imgOffX = 0;
+let imgOffY = 0;
+
+// Normalized center of the frame opening + spawn points along its inner edge
+// (detected from the PNG's alpha channel).
+const FRAME_CENTER = { x: 0.524, y: 0.49 };
+const MUNECO_SPAWNS = [
+  { x: 0.131, y: 0.49 }, { x: 0.131, y: 0.385 }, { x: 0.144, y: 0.302 }, { x: 0.188, y: 0.219 },
+  { x: 0.237, y: 0.219 }, { x: 0.269, y: 0.208 }, { x: 0.356, y: 0.219 }, { x: 0.394, y: 0.198 },
+  { x: 0.431, y: 0.177 }, { x: 0.487, y: 0.156 }, { x: 0.544, y: 0.156 }, { x: 0.575, y: 0.219 },
+  { x: 0.631, y: 0.198 }, { x: 0.675, y: 0.198 }, { x: 0.713, y: 0.219 }, { x: 0.756, y: 0.24 },
+  { x: 0.825, y: 0.198 }, { x: 0.856, y: 0.219 }, { x: 0.881, y: 0.281 }, { x: 0.9, y: 0.375 },
+  { x: 0.9, y: 0.479 }, { x: 0.9, y: 0.583 }, { x: 0.9, y: 0.677 }, { x: 0.881, y: 0.771 },
+  { x: 0.831, y: 0.792 }, { x: 0.769, y: 0.781 }, { x: 0.769, y: 0.813 }, { x: 0.675, y: 0.76 },
+  { x: 0.619, y: 0.76 }, { x: 0.575, y: 0.813 }, { x: 0.525, y: 0.833 }, { x: 0.469, y: 0.833 },
+  { x: 0.406, y: 0.833 }, { x: 0.4, y: 0.75 }, { x: 0.356, y: 0.708 }, { x: 0.294, y: 0.708 },
+  { x: 0.2, y: 0.74 }, { x: 0.181, y: 0.729 }, { x: 0.144, y: 0.677 }, { x: 0.131, y: 0.594 },
+];
+
 function setup() {
   const cnv = createCanvas(windowWidth, windowHeight);
   cnv.parent("app");
+
+  // Load the nature frame image asynchronously; draw it once it's ready.
+  loadImage("ambiente.png", onImageLoaded, onImageError);
 
   bodyPose = ml5.bodyPose("MoveNet", { modelType: "MULTIPOSE_LIGHTNING" }, onBodyPoseReady);
   handPose = ml5.handPose({ maxHands: 4 }, onHandPoseReady);
@@ -95,6 +123,7 @@ function setup() {
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
   updateCoverTransform();
+  updateImageTransform();
 }
 
 // --- Camera ---------------------------------------------------------------
@@ -129,6 +158,39 @@ function updateCoverTransform() {
     coverOffX = 0;
     coverOffY = (height - videoH * coverScale) / 2;
   }
+}
+
+// Cover transform for the nature frame image (fills the screen, crops overflow).
+function updateImageTransform() {
+  const ia = imgW / imgH;
+  const ca = width / height;
+  if (ca > ia) {
+    imgScale = height / imgH;
+    imgOffX = (width - imgW * imgScale) / 2;
+    imgOffY = 0;
+  } else {
+    imgScale = width / imgW;
+    imgOffX = 0;
+    imgOffY = (height - imgH * imgScale) / 2;
+  }
+}
+
+// Maps a normalized image coordinate (0..1) to screen space.
+function mapImageToScreen(nx, ny) {
+  return { x: nx * imgW * imgScale + imgOffX, y: ny * imgH * imgScale + imgOffY };
+}
+
+function onImageLoaded(img) {
+  ambientImg = img; // p5 2.x delivers the real image via the callback
+  imgW = img.width;
+  imgH = img.height;
+  imgReady = true;
+  updateImageTransform();
+  console.log("[tracker] ambiente cargado", imgW, "x", imgH);
+}
+
+function onImageError() {
+  console.warn("[tracker] no se pudo cargar ambiente.png");
 }
 
 // --- Readiness (body and hand start independently) ------------------------
@@ -208,6 +270,11 @@ function draw() {
 
   if (videoReady && bodyStarted) drawBodies();
   if (videoReady && handStarted) drawHands();
+
+  // Nature frame drawn over the camera (its transparent center shows players).
+  if (imgReady && ambientImg) {
+    image(ambientImg, imgOffX, imgOffY, imgW * imgScale, imgH * imgScale);
+  }
 
   updateMunecos();
   drawMunecos();
@@ -348,10 +415,10 @@ function gestureColor(label) {
   return [255, 176, 32]; // amber
 }
 
-// --- Muñecos (placeholder characters spawning from the screen edges) ------
+// --- Muñecos (placeholder characters spawning from the frame holes) -------
 //
-// For now these are simple colored blobs; later they'll come out of the
-// nature-frame holes along the border.
+// Simple colored blobs for now; they emerge from the frame's inner edge and
+// pop inward. Later they'll be replaced by the real characters.
 
 function updateMunecos() {
   const now = millis();
@@ -367,35 +434,30 @@ function updateMunecos() {
 }
 
 function randomSpawnDelay() {
-  // Random interval whose range drifts over time, so the pace varies.
+  // Random interval that drifts over time; faster overall than before.
   const t = millis() / 1000;
-  const drift = 0.5 + 0.5 * Math.sin(t / 6); // 0..1 oscillation (~37s)
-  const lo = lerp(500, 1800, drift);
-  return random(lo, lo + 1500);
+  const drift = 0.5 + 0.5 * Math.sin(t / 5); // 0..1 oscillation (~31s)
+  const lo = lerp(350, 800, drift);
+  return random(lo, lo + 600);
 }
 
 function spawnMuneco() {
-  const r = random(16, 26);
-  const inset = r + 34; // how far inward it pops from the edge
-  let startX, startY, targetX, targetY;
+  const r = random(32, 52); // 2x bigger placeholder
+  const spawn = MUNECO_SPAWNS[Math.floor(random(MUNECO_SPAWNS.length))];
+  const start = mapImageToScreen(spawn.x, spawn.y);
+  const center = mapImageToScreen(FRAME_CENTER.x, FRAME_CENTER.y);
 
-  switch (Math.floor(random(4))) {
-    case 0: // top
-      startX = random(width); startY = -r; targetX = startX; targetY = inset;
-      break;
-    case 1: // bottom
-      startX = random(width); startY = height + r; targetX = startX; targetY = height - inset;
-      break;
-    case 2: // left
-      startX = -r; startY = random(height); targetX = inset; targetY = startY;
-      break;
-    default: // right
-      startX = width + r; startY = random(height); targetX = width - inset; targetY = startY;
-      break;
-  }
+  // Pop inward from the hole toward the center of the frame opening.
+  const dx = center.x - start.x;
+  const dy = center.y - start.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const popDist = r + 46;
 
   munecos.push({
-    startX, startY, targetX, targetY,
+    startX: start.x,
+    startY: start.y,
+    targetX: start.x + (dx / len) * popDist,
+    targetY: start.y + (dy / len) * popDist,
     r,
     col: MUNECO_COLORS[Math.floor(random(MUNECO_COLORS.length))],
     bornAt: millis(),
