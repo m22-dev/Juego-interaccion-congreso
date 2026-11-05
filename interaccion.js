@@ -39,6 +39,25 @@ let coverScale = 1;
 let coverOffX = 0;
 let coverOffY = 0;
 
+// Lightweight exponential smoothing to reduce keypoint jitter.
+class Smooth {
+  constructor(factor = 0.5) {
+    this.factor = factor;
+    this.map = new Map();
+  }
+  next(key, x, y, maxJump = 120) {
+    const prev = this.map.get(key);
+    if (!prev || Math.hypot(prev.x - x, prev.y - y) > maxJump) {
+      this.map.set(key, { x, y });
+      return { x, y };
+    }
+    const sx = prev.x + (x - prev.x) * this.factor;
+    const sy = prev.y + (y - prev.y) * this.factor;
+    this.map.set(key, { x: sx, y: sy });
+    return { x: sx, y: sy };
+  }
+}
+
 const bodySmooth = new Smooth(0.5);
 const handSmoothers = {}; // one smoother per hand (keyed by side + handedness)
 
@@ -46,7 +65,7 @@ function setup() {
   const cnv = createCanvas(windowWidth, windowHeight);
   cnv.parent("app");
 
-  bodyPose = ml5.bodyPose("MoveNet", { modelType: "MultiPose.Lightning" }, onBodyPoseReady);
+  bodyPose = ml5.bodyPose("MoveNet", { modelType: "MULTIPOSE_LIGHTNING" }, onBodyPoseReady);
   handPose = ml5.handPose({ maxHands: 4 }, onHandPoseReady);
 
   initCamera();
@@ -331,23 +350,4 @@ function handKey(hand) {
 function keyPressed() {
   if (key === "m" || key === "M") mirror = !mirror;
   if (key === "r" || key === "R") initCamera();
-}
-
-// Lightweight exponential smoothing to reduce keypoint jitter.
-class Smooth {
-  constructor(factor = 0.5) {
-    this.factor = factor;
-    this.map = new Map();
-  }
-  next(key, x, y, maxJump = 120) {
-    const prev = this.map.get(key);
-    if (!prev || Math.hypot(prev.x - x, prev.y - y) > maxJump) {
-      this.map.set(key, { x, y });
-      return { x, y };
-    }
-    const sx = prev.x + (x - prev.x) * this.factor;
-    const sy = prev.y + (y - prev.y) * this.factor;
-    this.map.set(key, { x: sx, y: sy });
-    return { x: sx, y: sy };
-  }
 }
