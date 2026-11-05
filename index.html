@@ -25,6 +25,29 @@
 </head>
 <body>
   <div id="app"></div>
+
+  <!-- Background music: "Winter Fun (short ver.)" by AudioCoffee (CC BY-NC 4.0)
+       https://freesound.org/people/AudioCoffee/sounds/717284/ -->
+  <audio id="bgm" src="https://cdn.freesound.org/previews/717/717284_15232790-hq.mp3" loop preload="auto"></audio>
+  <script>
+    (function () {
+      const bgm = document.getElementById("bgm");
+      function tryPlay() {
+        const p = bgm.play();
+        if (p && p.catch) p.catch(() => {});
+      }
+      // Try right away (some browsers allow it once a permission prompt is granted).
+      tryPlay();
+      // Fallback: browsers block audible autoplay until the first user gesture.
+      const events = ["pointerdown", "keydown", "touchstart"];
+      function onGesture() {
+        tryPlay();
+        events.forEach((e) => window.removeEventListener(e, onGesture));
+      }
+      events.forEach((e) => window.addEventListener(e, onGesture));
+    })();
+  </script>
+
   <script src="interaccion.js"></script>
 </body>
 </html>
