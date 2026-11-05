@@ -1,9 +1,9 @@
-// Arm & Fist Tracker
-// Webcam + ml5.js (bodyPose "MoveNet" + handPose) + p5.js
+// Arm & Fist Tracker — 2-player
+// Webcam + ml5.js (bodyPose "MoveNet" MultiPose + handPose) + p5.js
 //
-// Fullscreen camera feed with a skeleton overlay. Tracks the arms
-// (shoulder -> elbow -> wrist) and tints each hand by gesture
-// (fist = red, open = green, partial = amber). No on-screen text.
+// Fullscreen camera feed with a subtle skeleton for the first two people on
+// screen, a subtle vertical divider at the center, and gesture-tinted hands.
+// No on-screen text.
 
 const SCORE_THRESHOLD = 0.3; // minimum confidence for a body keypoint
 
@@ -45,8 +45,9 @@ function setup() {
   const cnv = createCanvas(windowWidth, windowHeight);
   cnv.parent("app");
 
-  bodyPose = ml5.bodyPose("MoveNet", onBodyPoseReady);
-  handPose = ml5.handPose({ maxHands: 2 }, onHandPoseReady);
+  // MultiPose tracks several people at once (capped to the first two on draw).
+  bodyPose = ml5.bodyPose("MoveNet", { modelType: "MultiPose.Lightning" }, onBodyPoseReady);
+  handPose = ml5.handPose({ maxHands: 4 }, onHandPoseReady);
 
   initCamera();
 }
@@ -123,7 +124,7 @@ function tryStart() {
 }
 
 function gotPoses(results) {
-  poses = results || [];
+  poses = (results || []).slice(0, 2); // first two people only
   for (const pose of poses) {
     for (const kp of pose.keypoints) {
       kp.x = kp.x * coverScale + coverOffX;
@@ -161,28 +162,27 @@ function draw() {
   if (started && videoReady) {
     drawBodies();
     drawHands();
+    drawDivider();
   }
 }
 
-// --- Body (arms) ----------------------------------------------------------
+// --- Body (subtle skeleton, up to 2 people) -------------------------------
 
 function drawBodies() {
-  for (const pose of poses) drawPose(pose);
+  poses.forEach((pose, i) => drawPose(pose, i));
 }
 
-function drawPose(pose) {
+function drawPose(pose, index) {
   const sm = [];
-  const byName = {};
   for (const kp of pose.keypoints) {
-    const p = bodySmooth.next(kp.name, kp.x, kp.y);
-    const s = { ...kp, x: p.x, y: p.y };
-    sm.push(s);
-    byName[s.name] = s;
+    // Per-person smoothing key so the two players don't share state.
+    const p = bodySmooth.next(`${index}:${kp.name}`, kp.x, kp.y);
+    sm.push({ ...kp, x: p.x, y: p.y });
   }
 
-  // Full skeleton (subtle).
-  stroke(255, 255, 255, 55);
-  strokeWeight(2);
+  // Subtle full-body skeleton.
+  stroke(255, 255, 255, 70);
+  strokeWeight(1.5);
   for (const [a, b] of bodyConnections) {
     const pa = sm[a];
     const pb = sm[b];
@@ -191,40 +191,23 @@ function drawPose(pose) {
     }
   }
 
-  // Arms highlighted (left = cyan, right = pink).
-  drawBone(byName, "left_shoulder", "left_elbow", "#35e0ff");
-  drawBone(byName, "left_elbow", "left_wrist", "#35e0ff");
-  drawBone(byName, "right_shoulder", "right_elbow", "#ff5b8a");
-  drawBone(byName, "right_elbow", "right_wrist", "#ff5b8a");
-
-  drawJoint(byName, "left_shoulder", "#35e0ff");
-  drawJoint(byName, "left_elbow", "#35e0ff");
-  drawJoint(byName, "left_wrist", "#35e0ff");
-  drawJoint(byName, "right_shoulder", "#ff5b8a");
-  drawJoint(byName, "right_elbow", "#ff5b8a");
-  drawJoint(byName, "right_wrist", "#ff5b8a");
-}
-
-function drawBone(byName, a, b, col) {
-  const pa = byName[a];
-  const pb = byName[b];
-  if (!pa || !pb || pa.score < SCORE_THRESHOLD || pb.score < SCORE_THRESHOLD) return;
-  stroke(col);
-  strokeWeight(8);
-  line(px(pa.x), pa.y, px(pb.x), pb.y);
-  stroke(255);
-  strokeWeight(3);
-  line(px(pa.x), pa.y, px(pb.x), pb.y);
-}
-
-function drawJoint(byName, name, col) {
-  const p = byName[name];
-  if (!p || p.score < SCORE_THRESHOLD) return;
+  // Subtle joints.
   noStroke();
-  fill(col);
-  circle(px(p.x), p.y, 15);
-  fill(255);
-  circle(px(p.x), p.y, 6);
+  fill(255, 255, 255, 90);
+  for (const kp of sm) {
+    if (kp.score > SCORE_THRESHOLD) circle(px(kp.x), kp.y, 4);
+  }
+}
+
+// Subtle vertical divider at the center of the screen.
+function drawDivider() {
+  stroke(255, 255, 255, 70);
+  strokeWeight(1.5);
+  const dash = 12;
+  const gap = 16;
+  for (let y = 0; y < height; y += dash + gap) {
+    line(width / 2, y, width / 2, Math.min(y + dash, height));
+  }
 }
 
 // --- Hands (fists) --------------------------------------------------------
@@ -234,7 +217,11 @@ function drawHands() {
 }
 
 function drawHand(hand) {
-  const key = handKey(hand);
+  // Identify the player by wrist position relative to the center line
+  // (players stay on their own side, so side is a stable ownership cue).
+  const wristRaw = hand.keypoints.find((k) => k.name === "wrist");
+  const side = wristRaw ? (px(wristRaw.x) < width / 2 ? "L" : "R") : "?";
+  const key = `${side}:${handKey(hand)}`;
   if (!handSmoothers[key]) handSmoothers[key] = new Smooth(0.5);
 
   const sm = [];
@@ -248,19 +235,19 @@ function drawHand(hand) {
 
   const col = gestureColor(handGesture(byName).label);
 
-  // Skeleton.
-  stroke(col[0], col[1], col[2], 210);
-  strokeWeight(2);
+  // Subtle skeleton lines.
+  stroke(col[0], col[1], col[2], 90);
+  strokeWeight(1.2);
   for (const [a, b] of handConnections) {
     const pa = sm[a];
     const pb = sm[b];
     if (pa && pb) line(px(pa.x), pa.y, px(pb.x), pb.y);
   }
 
-  // Landmarks.
+  // Small landmarks.
   noStroke();
-  fill(col[0], col[1], col[2]);
-  for (const kp of sm) circle(px(kp.x), kp.y, 6);
+  fill(col[0], col[1], col[2], 160);
+  for (const kp of sm) circle(px(kp.x), kp.y, 4);
 }
 
 // Detects fist vs open hand by comparing fingertip-to-wrist distance against
