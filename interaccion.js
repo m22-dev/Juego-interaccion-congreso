@@ -111,8 +111,10 @@ function setup() {
     loadImage(f, (img) => { charImgs[i] = img; }, () => console.warn("[tracker] no cargó " + f));
   });
 
-  bodyPose = ml5.bodyPose("MoveNet", { modelType: "MULTIPOSE_LIGHTNING" }, onBodyPoseReady);
-  handPose = ml5.handPose({ maxHands: 4 }, onHandPoseReady);
+  // ml5 1.4 returns a Promise that resolves to the model, and only the model
+  // has detectStart(). Older builds return the model directly, so handle both.
+  loadPoseModel(ml5.bodyPose("MoveNet", { modelType: "MULTIPOSE_LIGHTNING" }), "bodyPose", onBodyPoseReady);
+  loadPoseModel(ml5.handPose({ maxHands: 4 }), "handPose", onHandPoseReady);
 
   initCamera();
 
@@ -185,13 +187,27 @@ function onVideoReady() {
   tryStartHand();
 }
 
-function onBodyPoseReady() {
+// ml5 1.x can return either the model or a Promise for it. Normalize both so the
+// readiness callbacks always receive a real model with detectStart().
+function loadPoseModel(result, name, onReady) {
+  if (result && typeof result.then === "function") {
+    result
+      .then((model) => onReady(model))
+      .catch((err) => console.error(`[tracker] ${name} no cargó:`, err));
+  } else {
+    onReady(result);
+  }
+}
+
+function onBodyPoseReady(model) {
+  if (model) bodyPose = model;
   bodyReady = true;
   console.log("[tracker] bodyPose listo");
   tryStartBody();
 }
 
-function onHandPoseReady() {
+function onHandPoseReady(model) {
+  if (model) handPose = model;
   handReady = true;
   console.log("[tracker] handPose listo");
   tryStartHand();
