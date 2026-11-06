@@ -73,6 +73,12 @@ let effects = [];
 const CHAR_FILES = ["kandinsky.svg", "shakespeare.svg", "vangogh.svg"];
 const charImgs = [];
 
+// Width/height ratio of a character (all three share the same viewBox).
+function charAspect(type) {
+  const img = charImgs[type];
+  return img && img.height ? img.width / img.height : 0.793;
+}
+
 let ambientImg;
 let imgReady = false;
 
@@ -85,13 +91,6 @@ const MUNECO_HOLES = [
   { x: 0.294, y: 0.784 }, // bottom-left (new)
   { x: 0.666, y: 0.83 },  // bottom-right (new)
 ];
-
-// Rotation for a hole based on its side: left = +90°, right = -90°, bottom = 0°.
-function holeRotation(x) {
-  if (x < 0.2) return HALF_PI; // left side, clockwise
-  if (x > 0.8) return -HALF_PI; // right side, counterclockwise
-  return 0; // bottom, head up
-}
 
 function setup() {
   const cnv = createCanvas(windowWidth, windowHeight);
@@ -254,12 +253,13 @@ function draw() {
   updateEffects();
 
   if (videoReady && handStarted) drawHands();
-  drawMunecos(); // drawn under the frame so they hide inside the trunk
 
-  // Nature frame drawn on top (covers the muñecos while they're in the trunk).
+  // Nature frame first, then the muñecos on top so the trunk never covers them.
   if (imgReady && ambientImg) {
     image(ambientImg, 0, 0, width, height);
   }
+
+  drawMunecos();
 
   // Impact feedback stays visible over the frame.
   drawEffects();
@@ -429,7 +429,7 @@ function gestureColor(label) {
 // --- Muñecos (art characters that pop out of and back into the tree holes) -
 //
 // Each one emerges from a free hole, rests briefly, then retreats back into
-// it. Left-side characters are rotated +45°, right-side -45°.
+// it. They always pop upright, whatever the hole's position.
 
 function updateMunecos() {
   const now = millis();
@@ -463,30 +463,44 @@ function spawnMuneco() {
 
   const hole = free[Math.floor(random(free.length))];
   const spawn = MUNECO_HOLES[hole];
+  const type = Math.floor(random(CHAR_FILES.length));
   const h = height * random(0.14, 0.18); // character height (~14-18% of screen)
+  const w = h * charAspect(type);
   const popDuration = 380;
   // +1s of extra idle time so players have time to react before it retreats.
   const idleDuration = random(1400, 2200);
 
   // Map the hole (normalized to the SVG viewBox) straight onto the screen.
-  const startX = spawn.x * width;
-  const startY = spawn.y * height;
+  const holeX = spawn.x * width;
+  const holeY = spawn.y * height;
 
   // Slide inward from the hole toward the center of the screen.
-  const dx = width / 2 - startX;
-  const dy = height / 2 - startY;
+  const dx = width / 2 - holeX;
+  const dy = height / 2 - holeY;
   const len = Math.hypot(dx, dy) || 1;
   const popDist = h * 0.35;
 
+  // Keep the whole character on screen. Side holes draw it rotated, so there
+  // the on-screen box is h wide by w tall instead of w by h.
+  const rotation = holeRotation(spawn.x);
+  const sideways = Math.abs(rotation) > 0.1;
+  const boxW = sideways ? h : w;
+  const boxH = sideways ? w : h;
+  const margin = 6;
+  const halfW = boxW / 2 + margin;
+  const halfH = boxH / 2 + margin;
+  const targetX = constrain(holeX + (dx / len) * popDist, halfW, width - halfW);
+  const targetY = constrain(holeY + (dy / len) * popDist, halfH, height - halfH);
+
   munecos.push({
-    type: Math.floor(random(CHAR_FILES.length)), // random character
+    type, // random character
     hole,
     h,
-    rotation: holeRotation(spawn.x),
-    startX,
-    startY,
-    targetX: startX + (dx / len) * popDist,
-    targetY: startY + (dy / len) * popDist,
+    rotation,
+    startX: holeX,
+    startY: holeY,
+    targetX,
+    targetY,
     bornAt: millis(),
     popDuration,
     idleDuration,
@@ -529,8 +543,7 @@ function munecoPose(m) {
     y = lerp(m.targetY, m.startY, e);
   }
 
-  const img = charImgs[m.type];
-  const aspect = img && img.height ? img.width / img.height : 0.793;
+  const aspect = charAspect(m.type);
   return { x, y, w: m.h * aspect * scale, h: m.h * scale, scale };
 }
 
