@@ -69,6 +69,12 @@ let nextSpawnAt = 0;
 // Placeholder impact effects (expanding ring + sparks) shown when a fist hits.
 let effects = [];
 
+// Score per player (left / right of the divider), +10 for every character hit.
+let scores = { L: 0, R: 0 };
+
+// UI font, loaded from Google Fonts in index.html.
+const SCORE_FONT = "Mochiy Pop One";
+
 // The 3 character portraits (Kandinsky, Shakespeare, Van Gogh), loaded async.
 const CHAR_FILES = ["kandinsky.svg", "shakespeare.svg", "vangogh.svg"];
 const charImgs = [];
@@ -83,13 +89,14 @@ let ambientImg;
 let imgReady = false;
 
 // The tree holes (normalized to the SVG viewBox 2573.89 x 1562.94) that the
-// muñecos pop out of: 2 left, 1 right-upper, and 2 at the bottom (new).
+// muñecos pop out of. Centers measured from the dark knothole paths in the art:
+// 2 left, 1 right-upper, and 2 at the bottom.
 const MUNECO_HOLES = [
-  { x: 0.022, y: 0.371 }, // left-upper
-  { x: 0.084, y: 0.552 }, // left-lower
-  { x: 0.963, y: 0.356 }, // right-upper
-  { x: 0.294, y: 0.784 }, // bottom-left (new)
-  { x: 0.666, y: 0.83 },  // bottom-right (new)
+  { x: 0.02343, y: 0.37366 }, // left-upper
+  { x: 0.08561, y: 0.55773 }, // left-lower
+  { x: 0.96657, y: 0.35916 }, // right-upper
+  { x: 0.29716, y: 0.79254 }, // bottom-left
+  { x: 0.66974, y: 0.83954 }, // bottom-right
 ];
 
 // Rotation for a hole based on its side: left = +90°, right = -90°, bottom = 0°.
@@ -102,6 +109,11 @@ function holeRotation(x) {
 function setup() {
   const cnv = createCanvas(windowWidth, windowHeight);
   cnv.parent("app");
+
+  // Preload the UI font so the score uses it as soon as it is available.
+  if (document.fonts && document.fonts.load) {
+    document.fonts.load(`16px "${SCORE_FONT}"`).catch(() => {});
+  }
 
   // Load the nature frame image asynchronously; draw it once it's ready.
   loadImage("ambiente.svg", onImageLoaded, onImageError);
@@ -289,7 +301,44 @@ function draw() {
 
   if (videoReady) drawDivider();
 
+  drawScores();
+
   drawStatusDot();
+}
+
+// --- Score -----------------------------------------------------------------
+
+function drawScores() {
+  const size = Math.max(26, width * 0.045);
+  const margin = Math.max(14, width * 0.035);
+
+  push();
+  textFont(SCORE_FONT);
+  textSize(size);
+  textAlign(CENTER, CENTER);
+
+  // Left player (warm gold) and right player (cool mint).
+  drawScore(scores.L, margin + size * 0.6, margin + size * 0.55, [255, 211, 110]);
+  drawScore(scores.R, width - margin - size * 0.6, margin + size * 0.55, [168, 230, 207]);
+
+  pop();
+}
+
+function drawScore(value, x, y, rgb) {
+  const weight = Math.max(4, width * 0.006);
+
+  // Soft drop shadow.
+  noStroke();
+  fill(0, 0, 0, 90);
+  text(value, x + 3, y + 4);
+
+  // Thick dark outline so the number reads on top of the foliage.
+  stroke(43, 26, 16);
+  strokeWeight(weight);
+  fill(rgb[0], rgb[1], rgb[2]);
+  text(value, x, y);
+
+  noStroke();
 }
 
 // --- Body (subtle skeleton, up to 2 people) -------------------------------
@@ -497,11 +546,13 @@ function spawnMuneco() {
   const holeX = spawn.x * width;
   const holeY = spawn.y * height;
 
-  // Slide inward from the hole toward the center of the screen.
-  const dx = width / 2 - holeX;
-  const dy = height / 2 - holeY;
+  // Side holes slide inward toward the screen center so they clear the trunk;
+  // bottom holes grow straight out of the middle of their hole, no drift.
+  const isBottom = spawn.y > 0.7;
+  const dx = isBottom ? 0 : width / 2 - holeX;
+  const dy = isBottom ? 0 : height / 2 - holeY;
   const len = Math.hypot(dx, dy) || 1;
-  const popDist = h * 0.35;
+  const popDist = isBottom ? 0 : h * 0.35;
 
   // Keep the whole character on screen. Side holes draw it rotated, so there
   // the on-screen box is h wide by w tall instead of w by h.
@@ -625,6 +676,10 @@ function resolveFistHits() {
       spawnHitEffect(p.x, p.y, m.h);
       munecos.splice(best, 1);
       lastFistHitAt[hs.key] = now;
+
+      // The punch scores for the player on the hand's side of the divider.
+      if (hs.side === "L") scores.L += 10;
+      else if (hs.side === "R") scores.R += 10;
     }
   }
 }
