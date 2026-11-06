@@ -72,11 +72,6 @@ const charImgs = [];
 let ambientImg;
 let imgReady = false;
 
-// Front layer: the same frame with the hole openings cut out, drawn on top of
-// the characters so they read as coming out of a hollow trunk.
-let ambientFrontImg;
-let frontReady = false;
-
 // The tree holes (normalized to the SVG viewBox 2573.89 x 1562.94) that the
 // muñecos pop out of: 2 left, 1 right-upper, and 2 at the bottom (new).
 const MUNECO_HOLES = [
@@ -100,8 +95,6 @@ function setup() {
 
   // Load the nature frame image asynchronously; draw it once it's ready.
   loadImage("ambiente.svg", onImageLoaded, onImageError);
-  // Front frame (same art with the hole openings masked out) for the 3 layers.
-  loadImage("ambiente-front.svg", onFrontLoaded, onFrontError);
 
   // Load the 3 character SVGs.
   CHAR_FILES.forEach((f, i) => {
@@ -169,16 +162,6 @@ function onImageLoaded(img) {
 
 function onImageError() {
   console.warn("[tracker] no se pudo cargar ambiente.svg");
-}
-
-function onFrontLoaded(img) {
-  ambientFrontImg = img;
-  frontReady = true;
-  console.log("[tracker] frente cargado", img.width, "x", img.height);
-}
-
-function onFrontError() {
-  console.warn("[tracker] no se pudo cargar ambiente-front.svg");
 }
 
 // --- Readiness (body and hand start independently) ------------------------
@@ -259,20 +242,12 @@ function draw() {
   if (videoReady && bodyStarted) drawBodies();
   if (videoReady && handStarted) drawHands();
 
-  // Layer 1 (back): full frame, including the dark hole interiors, drawn behind
-  // the characters so each hole reads as a hollow background.
+  updateMunecos();
+  drawMunecos(); // drawn under the frame so they hide inside the trunk
+
+  // Nature frame drawn on top (covers the muñecos while they're in the trunk).
   if (imgReady && ambientImg) {
     image(ambientImg, 0, 0, width, height);
-  }
-
-  // Layer 2 (middle): the characters, between the back and the front frame.
-  updateMunecos();
-  drawMunecos();
-
-  // Layer 3 (front): the frame with the hole openings cut out, so it covers the
-  // characters everywhere except through the hollow holes.
-  if (frontReady && ambientFrontImg) {
-    image(ambientFrontImg, 0, 0, width, height);
   }
 
   if (videoReady) drawDivider();
@@ -456,13 +431,11 @@ function spawnMuneco() {
   const startX = spawn.x * width;
   const startY = spawn.y * height;
 
-  // Slide inward from the hole toward the center of the screen. Kept short so
-  // the character stays inside the hole window instead of splitting into the
-  // transparent center.
+  // Slide inward from the hole toward the center of the screen.
   const dx = width / 2 - startX;
   const dy = height / 2 - startY;
   const len = Math.hypot(dx, dy) || 1;
-  const popDist = h * 0.12;
+  const popDist = h * 0.35;
 
   munecos.push({
     type: Math.floor(random(CHAR_FILES.length)), // random character
