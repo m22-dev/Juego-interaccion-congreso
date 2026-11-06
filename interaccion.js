@@ -88,6 +88,9 @@ function charAspect(type) {
 let ambientImg;
 let imgReady = false;
 
+// Comic burst shown where a punch lands (PARTICULAS-02.svg, copied as particulas.svg).
+let burstImg;
+
 // The tree holes (normalized to the SVG viewBox 2573.89 x 1562.94) that the
 // muñecos pop out of. Centers measured from the dark knothole paths in the art:
 // 2 left, 1 right-upper, and 2 at the bottom.
@@ -122,6 +125,13 @@ function setup() {
   CHAR_FILES.forEach((f, i) => {
     loadImage(f, (img) => { charImgs[i] = img; }, () => console.warn("[tracker] no cargó " + f));
   });
+
+  // Load the punch burst.
+  loadImage(
+    "particulas.svg",
+    (img) => { burstImg = img; },
+    () => console.warn("[tracker] no cargó particulas.svg")
+  );
 
   // ml5 1.4 returns a Promise that resolves to the model, and only the model
   // has detectStart(). Older builds return the model directly, so handle both.
@@ -695,10 +705,17 @@ function fistInsideMuneco(fx, fy, m, p) {
   return Math.abs(lx) <= p.w * 0.5 && Math.abs(ly) <= p.h * 0.55;
 }
 
-// --- Impact effect (placeholder) ------------------------------------------
+// --- Impact effect (comic burst) ------------------------------------------
 
 function spawnHitEffect(x, y, size) {
-  effects.push({ x, y, size, bornAt: millis(), duration: 420 });
+  effects.push({
+    x,
+    y,
+    size: size * 1.45, // burst is a bit larger than the character
+    rot: random(-0.3, 0.3), // varied angle per hit
+    bornAt: millis(),
+    duration: 460,
+  });
 }
 
 function updateEffects() {
@@ -709,32 +726,29 @@ function updateEffects() {
 }
 
 function drawEffects() {
+  if (!burstImg || !burstImg.width) return;
+
   const now = millis();
+  const ar = burstImg.width / burstImg.height;
 
   for (const e of effects) {
     const t = constrain((now - e.bornAt) / e.duration, 0, 1);
-    const r = lerp(e.size * 0.18, e.size * 0.72, easeOutCubic(t));
-    const a = 1 - t;
 
-    // Expanding ring.
-    noFill();
-    stroke(255, 226, 138, 240 * a);
-    strokeWeight(lerp(7, 1, t));
-    circle(e.x, e.y, r * 2);
+    // Pop out fast, then fade the last half.
+    const grow = easeOutCubic(t);
+    const scale = lerp(0.35, 1.15, grow);
+    const fade = 1 - constrain((t - 0.5) / 0.5, 0, 1);
 
-    // Sparks.
-    stroke(255, 255, 255, 220 * a);
-    strokeWeight(2);
-    for (let k = 0; k < 8; k++) {
-      const ang = (k / 8) * TWO_PI + t * 0.5;
-      const r0 = r * 0.85;
-      const r1 = r * (1.05 + 0.35 * (1 - t));
-      line(e.x + Math.cos(ang) * r0, e.y + Math.sin(ang) * r0,
-           e.x + Math.cos(ang) * r1, e.y + Math.sin(ang) * r1);
-    }
+    push();
+    translate(e.x, e.y);
+    rotate(e.rot + t * 0.25);
+    tint(255, 255 * fade);
+    imageMode(CENTER);
+    image(burstImg, 0, 0, e.size * scale * ar, e.size * scale);
+    pop();
   }
 
-  noStroke();
+  noTint();
 }
 
 function easeOutCubic(t) {
