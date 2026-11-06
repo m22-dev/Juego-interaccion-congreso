@@ -16,6 +16,7 @@ let handPose;
 
 let poses = [];
 let hands = [];
+let handStates = []; // smoothed per-hand data computed once per frame
 
 let bodyConnections = [];
 let handConnections = [];
@@ -64,6 +65,9 @@ const handSmoothers = {}; // one smoother per hand (keyed by side + handedness)
 // Muñecos: historical art characters that pop out of the tree holes.
 let munecos = [];
 let nextSpawnAt = 0;
+
+// Placeholder impact effects (expanding ring + sparks) shown when a fist hits.
+let effects = [];
 
 // The 3 character portraits (Kandinsky, Shakespeare, Van Gogh), loaded async.
 const CHAR_FILES = ["kandinsky.svg", "shakespeare.svg", "vangogh.svg"];
@@ -240,15 +244,25 @@ function draw() {
   }
 
   if (videoReady && bodyStarted) drawBodies();
-  if (videoReady && handStarted) drawHands();
+
+  // Hands are smoothed once per frame, then fist hits are resolved against the
+  // muñecos before drawing so a punched character vanishes immediately.
+  if (videoReady && handStarted) updateHands();
 
   updateMunecos();
+  if (videoReady && handStarted) resolveFistHits();
+  updateEffects();
+
+  if (videoReady && handStarted) drawHands();
   drawMunecos(); // drawn under the frame so they hide inside the trunk
 
   // Nature frame drawn on top (covers the muñecos while they're in the trunk).
   if (imgReady && ambientImg) {
     image(ambientImg, 0, 0, width, height);
   }
+
+  // Impact feedback stays visible over the frame.
+  drawEffects();
 
   if (videoReady) drawDivider();
 
@@ -309,11 +323,13 @@ function drawStatusDot() {
 
 // --- Hands (fists) --------------------------------------------------------
 
-function drawHands() {
-  for (const hand of hands) drawHand(hand);
+function updateHands() {
+  handStates = hands.map((hand) => handState(hand));
 }
 
-function drawHand(hand) {
+// Smooths one hand and classifies its gesture. Kept separate from drawing so the
+// exact same (smoothed) positions are used for hit detection.
+function handState(hand) {
   // Identify the player by wrist position relative to the center line
   // (players stay on their own side, so side is a stable ownership cue).
   const wristRaw = hand.keypoints.find((k) => k.name === "wrist");
@@ -330,21 +346,45 @@ function drawHand(hand) {
     byName[s.name] = s;
   }
 
-  const col = gestureColor(handGesture(byName).label);
+  return { key, side, sm, byName, gesture: handGesture(byName) };
+}
+
+function drawHands() {
+  for (const hs of handStates) drawHand(hs);
+}
+
+function drawHand(hs) {
+  const col = gestureColor(hs.gesture.label);
 
   // Subtle skeleton lines.
   stroke(col[0], col[1], col[2], 110);
   strokeWeight(1.2);
   for (const [a, b] of handConnections) {
-    const pa = sm[a];
-    const pb = sm[b];
+    const pa = hs.sm[a];
+    const pb = hs.sm[b];
     if (pa && pb) line(px(pa.x), pa.y, px(pb.x), pb.y);
   }
 
   // Small landmarks.
   noStroke();
   fill(col[0], col[1], col[2], 180);
-  for (const kp of sm) circle(px(kp.x), kp.y, 5);
+  for (const kp of hs.sm) circle(px(kp.x), kp.y, 5);
+}
+
+// Center of the fist: wrist plus the four knuckles. Used as the punch point.
+function fistCenter(hs) {
+  const parts = ["wrist", "index_finger_mcp", "middle_finger_mcp", "ring_finger_mcp", "pinky_mcp"];
+  let sx = 0;
+  let sy = 0;
+  let n = 0;
+  for (const name of parts) {
+    const kp = hs.byName[name];
+    if (!kp) continue;
+    sx += px(kp.x);
+    sy += kp.y;
+    n++;
+  }
+  return n ? { x: sx / n, y: sy / n } : null;
 }
 
 // Detects fist vs open hand by comparing fingertip-to-wrist distance against
@@ -425,7 +465,8 @@ function spawnMuneco() {
   const spawn = MUNECO_HOLES[hole];
   const h = height * random(0.14, 0.18); // character height (~14-18% of screen)
   const popDuration = 380;
-  const idleDuration = random(400, 1200);
+  // +1s of extra idle time so players have time to react before it retreats.
+  const idleDuration = random(1400, 2200);
 
   // Map the hole (normalized to the SVG viewBox) straight onto the screen.
   const startX = spawn.x * width;
@@ -458,8 +499,9 @@ function drawMunecos() {
   for (const m of munecos) drawMuneco(m);
 }
 
-function drawMuneco(m) {
-  const img = charImgs[m.type];
+// Current on-screen pose of a muñeco (position + drawn size), shared by drawing,
+// hit detection and the impact effect.
+function munecoPose(m) {
   const age = m.age;
   const out = m.popDuration;
   const idleEnd = out + m.idleDuration;
@@ -487,20 +529,125 @@ function drawMuneco(m) {
     y = lerp(m.targetY, m.startY, e);
   }
 
+  const img = charImgs[m.type];
+  const aspect = img && img.height ? img.width / img.height : 0.793;
+  return { x, y, w: m.h * aspect * scale, h: m.h * scale, scale };
+}
+
+function drawMuneco(m) {
+  const img = charImgs[m.type];
+  const p = munecoPose(m);
+
   if (img && img.width) {
-    const w = m.h * (img.width / img.height);
     push();
-    translate(x, y);
+    translate(p.x, p.y);
     rotate(m.rotation);
     imageMode(CENTER);
-    image(img, 0, 0, w * scale, m.h * scale);
+    image(img, 0, 0, p.w, p.h);
     pop();
   } else {
     // Fallback while the character image is still loading.
     noStroke();
     fill(255, 200, 80);
-    circle(x, y, m.h * 0.4 * scale);
+    circle(p.x, p.y, m.h * 0.4 * p.scale);
   }
+}
+
+// --- Fist hits ------------------------------------------------------------
+
+const FIST_HIT_COOLDOWN_MS = 260; // max one knockout per hand per punch
+const lastFistHitAt = {};
+
+// Any fist (left or right player) that lands on a muñeco removes it instantly and
+// spawns a placeholder impact effect.
+function resolveFistHits() {
+  const now = millis();
+
+  for (const hs of handStates) {
+    if (hs.gesture.closed < 3) continue; // only a closed fist counts
+    const fist = fistCenter(hs);
+    if (!fist) continue;
+    if (now - (lastFistHitAt[hs.key] || -Infinity) < FIST_HIT_COOLDOWN_MS) continue;
+
+    let best = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < munecos.length; i++) {
+      const m = munecos[i];
+      const p = munecoPose(m);
+      if (p.scale < 0.35) continue; // still too small to be hit
+      if (!fistInsideMuneco(fist.x, fist.y, m, p)) continue;
+      const d = Math.hypot(fist.x - p.x, fist.y - p.y);
+      if (d < bestDist) {
+        bestDist = d;
+        best = i;
+      }
+    }
+
+    if (best >= 0) {
+      const m = munecos[best];
+      const p = munecoPose(m);
+      spawnHitEffect(p.x, p.y, m.h);
+      munecos.splice(best, 1);
+      lastFistHitAt[hs.key] = now;
+    }
+  }
+}
+
+// Tests the fist point against the muñeco's rotated bounding box.
+function fistInsideMuneco(fx, fy, m, p) {
+  const dx = fx - p.x;
+  const dy = fy - p.y;
+  const c = Math.cos(-m.rotation);
+  const s = Math.sin(-m.rotation);
+  const lx = dx * c - dy * s;
+  const ly = dx * s + dy * c;
+  return Math.abs(lx) <= p.w * 0.5 && Math.abs(ly) <= p.h * 0.55;
+}
+
+// --- Impact effect (placeholder) ------------------------------------------
+
+function spawnHitEffect(x, y, size) {
+  effects.push({ x, y, size, bornAt: millis(), duration: 420 });
+}
+
+function updateEffects() {
+  const now = millis();
+  for (let i = effects.length - 1; i >= 0; i--) {
+    if (now - effects[i].bornAt >= effects[i].duration) effects.splice(i, 1);
+  }
+}
+
+function drawEffects() {
+  const now = millis();
+
+  for (const e of effects) {
+    const t = constrain((now - e.bornAt) / e.duration, 0, 1);
+    const r = lerp(e.size * 0.18, e.size * 0.72, easeOutCubic(t));
+    const a = 1 - t;
+
+    // Expanding ring.
+    noFill();
+    stroke(255, 226, 138, 240 * a);
+    strokeWeight(lerp(7, 1, t));
+    circle(e.x, e.y, r * 2);
+
+    // Sparks.
+    stroke(255, 255, 255, 220 * a);
+    strokeWeight(2);
+    for (let k = 0; k < 8; k++) {
+      const ang = (k / 8) * TWO_PI + t * 0.5;
+      const r0 = r * 0.85;
+      const r1 = r * (1.05 + 0.35 * (1 - t));
+      line(e.x + Math.cos(ang) * r0, e.y + Math.sin(ang) * r0,
+           e.x + Math.cos(ang) * r1, e.y + Math.sin(ang) * r1);
+    }
+  }
+
+  noStroke();
+}
+
+function easeOutCubic(t) {
+  return 1 - Math.pow(1 - t, 3);
 }
 
 function easeOutBack(t) {
