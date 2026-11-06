@@ -72,10 +72,17 @@ const charImgs = [];
 let ambientImg;
 let imgReady = false;
 
-// Front layer: the same frame with the hole openings cut out, drawn on top of
-// the characters so they read as coming out of a hollow trunk.
-let ambientFrontImg;
+// Front layer: the frame with an elliptical window cut out at every hole, drawn
+// on top of the characters so the trunk always frames them.
+let frontLayer = null;
+let hollowLayer = null;
 let frontReady = false;
+
+// Holes get an elliptical "portal" sized to the character (screen px). It is
+// recomputed on every resize so the character always fits inside its window
+// instead of being trapped in the outer edge of the trunk.
+const CHAR_ASPECT = 222.14 / 280; // all three portraits share this aspect
+let portals = [];
 
 // The tree holes (normalized to the SVG viewBox 2573.89 x 1562.94) that the
 // muñecos pop out of: 2 left, 1 right-upper, and 2 at the bottom (new).
@@ -88,6 +95,8 @@ const MUNECO_HOLES = [
 ];
 
 // Rotation for a hole based on its side: left = +90°, right = -90°, bottom = 0°.
+// Kept for reference: characters are drawn upright now, but side rotation can be
+// re-enabled here if the sideways "head-first" look is wanted again.
 function holeRotation(x) {
   if (x < 0.2) return HALF_PI; // left side, clockwise
   if (x > 0.8) return -HALF_PI; // right side, counterclockwise
@@ -100,8 +109,7 @@ function setup() {
 
   // Load the nature frame image asynchronously; draw it once it's ready.
   loadImage("ambiente.svg", onImageLoaded, onImageError);
-  // Front frame (same art with the hole openings masked out) for the 3 layers.
-  loadImage("ambiente-front.svg", onFrontLoaded, onFrontError);
+  computePortals();
 
   // Load the 3 character SVGs.
   CHAR_FILES.forEach((f, i) => {
@@ -125,6 +133,8 @@ function setup() {
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
   updateCoverTransform();
+  computePortals();
+  rebuildFrontLayer();
 }
 
 // --- Camera ---------------------------------------------------------------
@@ -165,20 +175,83 @@ function onImageLoaded(img) {
   ambientImg = img; // p5 2.x delivers the real image via the callback
   imgReady = true;
   console.log("[tracker] ambiente cargado", img.width, "x", img.height);
+  computePortals();
+  rebuildFrontLayer();
 }
 
 function onImageError() {
   console.warn("[tracker] no se pudo cargar ambiente.svg");
 }
 
-function onFrontLoaded(img) {
-  ambientFrontImg = img;
-  frontReady = true;
-  console.log("[tracker] frente cargado", img.width, "x", img.height);
+// Elliptical window for each hole, sized to the character that pops out of it.
+function computePortals() {
+  if (!width || !height) return;
+  const charH = height * 0.16;
+  const charW = charH * CHAR_ASPECT;
+  portals = MUNECO_HOLES.map((hole, i) => {
+    const rotation = 0; // upright: a sideways portrait reads oddly out of a hole
+    const ew = charW;
+    const eh = charH;
+    const rx = ew * 0.52;
+    const ry = eh * 0.62;
+    const pad = 4;
+    const cx = Math.min(Math.max(hole.x * width, rx + pad), Math.max(rx + pad, width - rx - pad));
+    const cy = Math.min(Math.max(hole.y * height, ry + pad), Math.max(ry + pad, height - ry - pad));
+    return { hole: i, cx, cy, rx, ry, rotation };
+  });
 }
 
-function onFrontError() {
-  console.warn("[tracker] no se pudo cargar ambiente-front.svg");
+// Layer 4: the frame with the portal ellipses punched out (destination-out).
+function rebuildFrontLayer() {
+  if (!ambientImg || !ambientImg.width || !width || !height) return;
+
+  // Front frame: same art, holes erased so the trunk never covers a character.
+  if (frontLayer) frontLayer.remove();
+  frontLayer = createGraphics(width, height);
+  frontLayer.clear();
+  frontLayer.imageMode(CORNER);
+  frontLayer.image(ambientImg, 0, 0, width, height);
+  const fg = frontLayer.drawingContext;
+  fg.save();
+  fg.globalCompositeOperation = "destination-out";
+  fg.fillStyle = "#000000";
+  for (const p of portals) {
+    fg.beginPath();
+    fg.ellipse(p.cx, p.cy, p.rx, p.ry, 0, 0, Math.PI * 2);
+    fg.fill();
+  }
+  fg.restore();
+
+  // Dark hollow, clipped to the trunk alpha so it only darkens actual wood and
+  // never paints a dark disc over the camera in the transparent center.
+  if (hollowLayer) hollowLayer.remove();
+  hollowLayer = createGraphics(width, height);
+  hollowLayer.clear();
+  hollowLayer.imageMode(CORNER);
+  const hg = hollowLayer.drawingContext;
+  for (const p of portals) {
+    const grad = hg.createRadialGradient(p.cx, p.cy, 1, p.cx, p.cy, Math.max(p.rx, p.ry) * 1.08);
+    grad.addColorStop(0, "rgba(10, 5, 2, 0.96)");
+    grad.addColorStop(0.55, "rgba(26, 14, 7, 0.82)");
+    grad.addColorStop(1, "rgba(40, 22, 11, 0)");
+    hg.save();
+    hg.beginPath();
+    hg.ellipse(p.cx, p.cy, p.rx * 1.08, p.ry * 1.08, 0, 0, Math.PI * 2);
+    hg.fillStyle = grad;
+    hg.fill();
+    hg.restore();
+  }
+  hg.save();
+  hg.globalCompositeOperation = "destination-in";
+  hg.drawImage(ambientImg.canvas || ambientImg.elt, 0, 0, width, height);
+  hg.restore();
+
+  frontReady = true;
+}
+
+// Layer 2 (extra): the dark hollow interior that gives each portal depth.
+function drawHollows() {
+  if (hollowLayer) image(hollowLayer, 0, 0);
 }
 
 // --- Readiness (body and hand start independently) ------------------------
@@ -259,20 +332,23 @@ function draw() {
   if (videoReady && bodyStarted) drawBodies();
   if (videoReady && handStarted) drawHands();
 
-  // Layer 1 (back): full frame, including the dark hole interiors, drawn behind
-  // the characters so each hole reads as a hollow background.
+  // Layer 1 (back): full frame, including the dark hole interiors.
   if (imgReady && ambientImg) {
     image(ambientImg, 0, 0, width, height);
   }
 
-  // Layer 2 (middle): the characters, between the back and the front frame.
+  // Layer 2 (extra depth): the dark hollow inside each hole, behind the
+  // characters, so the hole reads as a real cavity with a background.
+  drawHollows();
+
+  // Layer 3 (middle): the characters, between the hollow and the front frame.
   updateMunecos();
   drawMunecos();
 
-  // Layer 3 (front): the frame with the hole openings cut out, so it covers the
-  // characters everywhere except through the hollow holes.
-  if (frontReady && ambientFrontImg) {
-    image(ambientFrontImg, 0, 0, width, height);
+  // Layer 4 (front): the frame with elliptical windows cut out, so the trunk
+  // frames each character and covers the parts that peek past the opening.
+  if (frontReady && frontLayer) {
+    image(frontLayer, 0, 0);
   }
 
   if (videoReady) drawDivider();
@@ -443,36 +519,26 @@ function randomSpawnDelay() {
 function spawnMuneco() {
   // Only use a hole that isn't already occupied (avoids overlapping designs).
   const used = new Set(munecos.map((m) => m.hole));
-  const free = MUNECO_HOLES.map((_, i) => i).filter((i) => !used.has(i));
+  const free = portals.map((_, i) => i).filter((i) => !used.has(i));
   if (free.length === 0) return;
 
   const hole = free[Math.floor(random(free.length))];
-  const spawn = MUNECO_HOLES[hole];
+  const portal = portals[hole];
   const h = height * random(0.14, 0.18); // character height (~14-18% of screen)
   const popDuration = 380;
   const idleDuration = random(400, 1200);
-
-  // Map the hole (normalized to the SVG viewBox) straight onto the screen.
-  const startX = spawn.x * width;
-  const startY = spawn.y * height;
-
-  // Slide inward from the hole toward the center of the screen. Kept short so
-  // the character stays inside the hole window instead of splitting into the
-  // transparent center.
-  const dx = width / 2 - startX;
-  const dy = height / 2 - startY;
-  const len = Math.hypot(dx, dy) || 1;
-  const popDist = h * 0.12;
 
   munecos.push({
     type: Math.floor(random(CHAR_FILES.length)), // random character
     hole,
     h,
-    rotation: holeRotation(spawn.x),
-    startX,
-    startY,
-    targetX: startX + (dx / len) * popDist,
-    targetY: startY + (dy / len) * popDist,
+    rotation: portal.rotation,
+    // Grow in place inside its portal: the trunk around the opening hides the
+    // first moments, so it reads as coming out of the hollow.
+    startX: portal.cx,
+    startY: portal.cy,
+    targetX: portal.cx,
+    targetY: portal.cy,
     bornAt: millis(),
     popDuration,
     idleDuration,
