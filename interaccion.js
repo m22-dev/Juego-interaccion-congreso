@@ -92,6 +92,13 @@ const MUNECO_HOLES = [
   { x: 0.666, y: 0.83 },  // bottom-right (new)
 ];
 
+// Rotation for a hole based on its side: left = +90°, right = -90°, bottom = 0°.
+function holeRotation(x) {
+  if (x < 0.2) return HALF_PI; // left side, clockwise
+  if (x > 0.8) return -HALF_PI; // right side, counterclockwise
+  return 0; // bottom, head up
+}
+
 function setup() {
   const cnv = createCanvas(windowWidth, windowHeight);
   cnv.parent("app");
@@ -429,7 +436,7 @@ function gestureColor(label) {
 // --- Muñecos (art characters that pop out of and back into the tree holes) -
 //
 // Each one emerges from a free hole, rests briefly, then retreats back into
-// it. They always pop upright, whatever the hole's position.
+// it. Side holes draw the character rotated +90° / -90°.
 
 function updateMunecos() {
   const now = millis();
