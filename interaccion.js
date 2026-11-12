@@ -797,12 +797,14 @@ function drawStatusDot() {
 // per second) and is inside a character. Resting or drifting stays below it.
 const PUNCH_MIN_SPEED_RATIO = 0.65; // of the screen height per second
 const PUNCH_MEMORY_MS = 170; // a fast frame keeps the fist "hot" this long
-const GLOVE_SHOW_MS = 420; // the glove flashes in after a punch, then fades
+const HAND_FADE_IN_MS = 140; // glove pops in when a hand is first seen
+const HAND_GRACE_MS = 400; // a briefly lost hand fades out instead of vanishing
 
 function updateHands() {
   const now = millis();
   const punchSpeed = Math.max(420, height * PUNCH_MIN_SPEED_RATIO);
   const next = [];
+  const seen = new Set();
 
   for (const pose of poses) {
     const byName = {};
@@ -828,8 +830,16 @@ function updateHands() {
 
       let st = wristMotion[key];
       if (!st) {
-        st = wristMotion[key] = { x, y, prevX: x, prevY: y, at: now, speed: 0, angle: 0, punchUntil: 0, gloveUntil: 0 };
+        st = wristMotion[key] = {
+          x, y, prevX: x, prevY: y, at: now, speed: 0, angle: 0,
+          punchUntil: 0, lastSeenAt: now, firstSeenAt: now,
+        };
       }
+
+      // Re-appearing after a gap fades in again instead of popping.
+      if (now - st.lastSeenAt > HAND_GRACE_MS) st.firstSeenAt = now;
+      st.lastSeenAt = now;
+      seen.add(key);
 
       const dt = (now - st.at) / 1000;
       if (dt >= 0.008) {
@@ -843,10 +853,7 @@ function updateHands() {
         st.at = now;
       }
 
-      if (st.speed >= punchSpeed) {
-        st.punchUntil = now + PUNCH_MEMORY_MS;
-        st.gloveUntil = now + GLOVE_SHOW_MS;
-      }
+      if (st.speed >= punchSpeed) st.punchUntil = now + PUNCH_MEMORY_MS;
 
       const shoulder = byName[wristName === "left_wrist" ? "left_shoulder" : "right_shoulder"];
       const raised = !!shoulder && y < shoulder.y - height * 0.04;
@@ -857,10 +864,13 @@ function updateHands() {
       if (elbow) targetAngle = constrain(Math.atan2(x - px(elbow.x), -(y - elbow.y)), -1.2, 1.2);
       st.angle += (targetAngle - st.angle) * 0.25;
 
+      st.side = side;
+      st.limb = wristName === "left_wrist" ? "left" : "right";
+
       next.push({
         key,
         side,
-        limb: wristName === "left_wrist" ? "left" : "right",
+        limb: st.limb,
         x,
         y,
         prevX: st.prevX,
@@ -868,10 +878,36 @@ function updateHands() {
         speed: st.speed,
         angle: st.angle,
         punchUntil: st.punchUntil,
-        gloveUntil: st.gloveUntil,
         raised,
+        alpha: constrain((now - st.firstSeenAt) / HAND_FADE_IN_MS, 0, 1),
+        live: true,
       });
     }
+  }
+
+  // Keep hands that just dropped out of the detection for a moment, fading
+  // them out. Without this the glove and its marker blink on every lost frame.
+  for (const key in wristMotion) {
+    if (seen.has(key)) continue;
+    const st = wristMotion[key];
+    const away = now - st.lastSeenAt;
+    if (away > HAND_GRACE_MS) continue;
+
+    next.push({
+      key,
+      side: st.side || "?",
+      limb: st.limb || "right",
+      x: st.x,
+      y: st.y,
+      prevX: st.x,
+      prevY: st.y,
+      speed: 0,
+      angle: st.angle,
+      punchUntil: 0,
+      raised: false,
+      alpha: 1 - away / HAND_GRACE_MS,
+      live: false,
+    });
   }
 
   handStates = next;
@@ -908,37 +944,36 @@ function gloveHitPad() {
 function drawHand(hs) {
   const now = millis();
   const hot = now < hs.punchUntil;
+  const alpha = hs.alpha === undefined ? 1 : hs.alpha;
+  if (alpha <= 0.02) return;
+
   const side = hs.side === "L" ? [255, 211, 110] : [168, 230, 207];
   const col = hot ? [255, 64, 84] : side;
 
-  // Tracking stays visible all the time: a soft glow at the wrist.
+  // Tracking glow behind the glove.
   if (drawingContext) {
     drawingContext.shadowBlur = hot ? 30 : 14;
-    drawingContext.shadowColor = `rgba(${col[0]}, ${col[1]}, ${col[2]}, 0.9)`;
+    drawingContext.shadowColor = `rgba(${col[0]}, ${col[1]}, ${col[2]}, ${0.9 * alpha})`;
   }
   noStroke();
-  fill(col[0], col[1], col[2], hot ? 190 : 120);
+  fill(col[0], col[1], col[2], (hot ? 190 : 120) * alpha);
   circle(hs.x, hs.y, hot ? 44 : 34);
   if (drawingContext) drawingContext.shadowBlur = 0;
 
-  // The glove only shows up for a moment after a punch is detected.
-  const gloveLeft = (hs.gloveUntil || 0) - now;
+  // The glove stays on screen while the hand is tracked; it only fades when
+  // the hand drops out of the detection for a moment.
   if (gloveReady && gloveImg) {
-    if (gloveLeft > 0) {
-      const fade = Math.min(1, (gloveLeft / GLOVE_SHOW_MS) * 3);
-      const grow = constrain((GLOVE_SHOW_MS - gloveLeft) / 90, 0.7, 1);
-      drawGlove(hs, hot, fade, grow);
-    }
+    drawGlove(hs, hot, alpha);
   } else {
     // Fallback while the glove SVG loads.
     noStroke();
-    fill(col[0], col[1], col[2], 235);
+    fill(col[0], col[1], col[2], 235 * alpha);
     circle(hs.x, hs.y, hot ? 22 : 15);
   }
 
   // Tracking ring on top, so the exact hit point stays readable.
   noFill();
-  stroke(col[0], col[1], col[2], hot ? 235 : 160);
+  stroke(col[0], col[1], col[2], (hot ? 235 : 160) * alpha);
   strokeWeight(hot ? 3 : 2);
   circle(hs.x, hs.y, 18);
 }
@@ -1140,6 +1175,7 @@ function resolveFistHits() {
   const now = millis();
 
   for (const hs of handStates) {
+    if (hs.live === false) continue; // a fading, already-lost hand cannot hit
     if (now >= hs.punchUntil) continue; // only a moving fist breaks a character
     if (now - (lastFistHitAt[hs.key] || -Infinity) < FIST_HIT_COOLDOWN_MS) continue;
 
@@ -1173,25 +1209,29 @@ function resolveFistHits() {
 }
 
 // Sweeps the wrist from its previous to its current position so a fast punch
-// cannot tunnel through a character between two pose frames.
+// cannot tunnel through a character between two pose frames. Also tests the
+// glove's pad, which sits above the wrist.
 function handSweepHits(hs, m, p) {
   for (let i = 0; i <= 3; i++) {
     const t = i / 3;
     if (fistInsideMuneco(lerp(hs.prevX, hs.x, t), lerp(hs.prevY, hs.y, t), m, p)) return true;
   }
-  return false;
+
+  const off = gloveHeight() * 0.45;
+  const ax = Math.sin(hs.angle || 0) * off;
+  const ay = -Math.cos(hs.angle || 0) * off;
+  return fistInsideMuneco(hs.x + ax, hs.y + ay, m, p, gloveHitPad() * 0.5);
 }
 
 // Tests the wrist point against the muñeco's rotated bounding box. The box is
 // widened by the glove radius so a visible punch connects more easily.
-function fistInsideMuneco(fx, fy, m, p) {
+function fistInsideMuneco(fx, fy, m, p, pad = gloveHitPad()) {
   const dx = fx - p.x;
   const dy = fy - p.y;
   const c = Math.cos(-m.rotation);
   const s = Math.sin(-m.rotation);
   const lx = dx * c - dy * s;
   const ly = dx * s + dy * c;
-  const pad = gloveHitPad();
   return Math.abs(lx) <= p.w * 0.58 + pad && Math.abs(ly) <= p.h * 0.62 + pad;
 }
 
