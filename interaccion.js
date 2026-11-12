@@ -1,9 +1,9 @@
 // Arm & Fist Tracker — 2-player
-// Webcam + ml5.js (bodyPose "MoveNet" MultiPose + handPose) + p5.js
+// Webcam + ml5.js bodyPose ("MoveNet" MultiPose) + p5.js
 //
 // Fullscreen camera feed with a subtle skeleton for the first two people on
-// screen, a subtle vertical divider at the center, and gesture-tinted hands.
-// No on-screen text.
+// screen and a glowing fist marker on each wrist. Punches are detected from
+// wrist motion, so the game reacts on the very first fast frame.
 
 const SCORE_THRESHOLD = 0.3; // minimum confidence for a body keypoint
 
@@ -12,20 +12,15 @@ const CAM_H = 720;
 
 let video;
 let bodyPose;
-let handPose;
 
 let poses = [];
-let hands = [];
-let handStates = []; // smoothed per-hand data computed once per frame
+let handStates = []; // smoothed per-wrist data computed once per frame
 
 let bodyConnections = [];
-let handConnections = [];
 
 let videoReady = false;
 let bodyReady = false;
-let handReady = false;
 let bodyStarted = false;
-let handStarted = false;
 
 let mirror = true; // natural "mirror" view
 
@@ -60,7 +55,8 @@ class Smooth {
 }
 
 const bodySmooth = new Smooth(0.5);
-const handSmoothers = {}; // one smoother per hand (keyed by side + handedness)
+const wristSmoothers = {}; // one smoother per player side + wrist
+const wristMotion = {}; // last screen position / velocity per wrist
 
 // Muñecos: historical art characters that pop out of the tree holes.
 let munecos = [];
@@ -134,6 +130,15 @@ let imgReady = false;
 // Comic burst shown where a punch lands (PARTICULAS-02.svg, copied as particulas.svg).
 let burstImg;
 
+// Boxing glove drawn in front of each tracked fist. The SVG holds a pair, so
+// each hand draws only its own half (crop fractions measured from the viewBox).
+let gloveImg;
+let gloveReady = false;
+const GLOVE_CROP = {
+  left: { sx: 0.0, sy: 0.0032, sw: 0.4614, sh: 0.9968 },
+  right: { sx: 0.5451, sy: 0.0043, sw: 0.4549, sh: 0.9957 },
+};
+
 // The tree holes (normalized to the SVG viewBox 2573.89 x 1562.94) that the
 // muñecos pop out of. Centers measured from the dark knothole paths in the art:
 // 2 left, 1 right-upper, and 2 at the bottom.
@@ -176,6 +181,13 @@ function setup() {
     () => console.warn("[tracker] no cargó particulas.svg")
   );
 
+  // Load the boxing glove that covers each tracked fist.
+  loadImage(
+    "guante.svg",
+    (img) => { gloveImg = img; gloveReady = true; },
+    () => console.warn("[tracker] no cargó guante.svg")
+  );
+
   // Preload the punch sound (a small pool so hits can overlap).
   initHitSound();
 
@@ -185,17 +197,15 @@ function setup() {
   // ml5 1.4 returns a Promise that resolves to the model, and only the model
   // has detectStart(). Older builds return the model directly, so handle both.
   loadPoseModel(ml5.bodyPose("MoveNet", { modelType: "MULTIPOSE_LIGHTNING" }), "bodyPose", onBodyPoseReady);
-  loadPoseModel(ml5.handPose({ maxHands: 4 }), "handPose", onHandPoseReady);
 
   initCamera();
 
   nextSpawnAt = millis() + randomSpawnDelay();
   bgNextSpawnAt = millis() + 350;
 
-  // Diagnostics: warn if a model never becomes ready (network/CORS issue).
+  // Diagnostics: warn if the model never becomes ready (network/CORS issue).
   window.setTimeout(() => {
     if (!bodyReady) console.warn("[tracker] bodyPose no cargó en 15s (¿red/TFHub bloqueado?)");
-    if (!handReady) console.warn("[tracker] handPose no cargó en 15s (¿red/CDN bloqueado?)");
   }, 15000);
 }
 
@@ -208,7 +218,6 @@ function windowResized() {
 
 function initCamera() {
   if (bodyStarted) { bodyPose.detectStop(); bodyStarted = false; }
-  if (handStarted) { handPose.detectStop(); handStarted = false; }
   videoReady = false;
   if (video) {
     if (video.elt && video.elt.srcObject) {
@@ -248,7 +257,7 @@ function onImageError() {
   console.warn("[tracker] no se pudo cargar ambiente.svg");
 }
 
-// --- Readiness (body and hand start independently) ------------------------
+// --- Readiness (body pose drives the hands) -------------------------------
 
 function onVideoReady() {
   videoW = video.elt.videoWidth || CAM_W;
@@ -256,7 +265,6 @@ function onVideoReady() {
   updateCoverTransform();
   videoReady = true;
   tryStartBody();
-  tryStartHand();
 }
 
 // ml5 1.x can return either the model or a Promise for it. Normalize both so the
@@ -278,13 +286,6 @@ function onBodyPoseReady(model) {
   tryStartBody();
 }
 
-function onHandPoseReady(model) {
-  if (model) handPose = model;
-  handReady = true;
-  console.log("[tracker] handPose listo");
-  tryStartHand();
-}
-
 function tryStartBody() {
   if (bodyStarted || !videoReady || !bodyReady) return;
   bodyStarted = true;
@@ -293,28 +294,10 @@ function tryStartBody() {
   console.log("[tracker] bodyPose detectStart iniciado");
 }
 
-function tryStartHand() {
-  if (handStarted || !videoReady || !handReady) return;
-  handStarted = true;
-  handPose.detectStart(video, gotHands);
-  handConnections = handPose.getConnections() || [];
-  console.log("[tracker] handPose detectStart iniciado");
-}
-
 function gotPoses(results) {
   poses = (results || []).slice(0, 2); // first two people only
   for (const pose of poses) {
     for (const kp of pose.keypoints) {
-      kp.x = kp.x * coverScale + coverOffX;
-      kp.y = kp.y * coverScale + coverOffY;
-    }
-  }
-}
-
-function gotHands(results) {
-  hands = results || [];
-  for (const hand of hands) {
-    for (const kp of hand.keypoints) {
       kp.x = kp.x * coverScale + coverOffX;
       kp.y = kp.y * coverScale + coverOffY;
     }
@@ -334,15 +317,15 @@ function draw() {
   drawCameraFeed();
   if (videoReady && bodyStarted) drawBodies();
 
-  // Hands are smoothed once per frame, then fist hits are resolved against the
-  // muñecos before drawing so a punched character vanishes immediately.
-  if (videoReady && handStarted) updateHands();
+  // Hands are smoothed once per frame, then punches are resolved against the
+  // muñecos before drawing so a hit character vanishes immediately.
+  if (videoReady && bodyStarted) updateHands();
 
   updateMunecos();
-  if (videoReady && handStarted) resolveFistHits();
+  if (videoReady && bodyStarted) resolveFistHits();
   updateEffects();
 
-  if (videoReady && handStarted) drawHands();
+  if (videoReady && bodyStarted) drawHands();
 
   // Nature frame first, then the muñecos on top so the trunk never covers them.
   if (imgReady && ambientImg) {
@@ -414,7 +397,7 @@ function drawStartScreen() {
   rect(0, 0, width, height);
 
   // Hands are smoothed once per frame; the same states feed the start gate.
-  if (videoReady && handStarted) {
+  if (videoReady && bodyStarted) {
     updateHands();
     drawHands();
   }
@@ -435,7 +418,7 @@ function drawStartScreen() {
   drawMenuText("PARA EMPEZAR", width / 2, layout.line2Y, layout.lineSize, [255, 246, 226]);
 
   // Either the fist indicators (when tracking works) or a short status line.
-  if (videoReady && handStarted) {
+  if (videoReady && bodyStarted) {
     drawFistDots(layout);
   } else {
     drawCameraStatus(layout.dotsY);
@@ -509,11 +492,11 @@ function drawMenuText(str, x, y, size, rgb) {
   pop();
 }
 
-// Reads the tracked hands and decides when both players are showing a fist.
+// Reads the tracked wrists and decides when both players have a fist up.
 function updateStartGate() {
-  const fists = handStates.filter((hs) => hs.gesture.closed >= 3 && !hs.gesture.pointing);
-  const left = fists.filter((hs) => hs.side === "L").length;
-  const right = fists.filter((hs) => hs.side === "R").length;
+  const up = handStates.filter((hs) => hs.raised);
+  const left = up.filter((hs) => hs.side === "L").length;
+  const right = up.filter((hs) => hs.side === "R").length;
   const ready = left >= 1 && right >= 1;
   const dt = Math.min(deltaTime, 100);
 
@@ -578,7 +561,7 @@ function drawFistDots(layout) {
 function drawCameraStatus(y) {
   let msg = null;
   if (!videoReady) msg = "ESPERANDO CÁMARA…";
-  else if (!handStarted) msg = "CARGANDO DETECCIÓN…";
+  else if (!bodyStarted) msg = "CARGANDO DETECCIÓN…";
   if (!msg) return;
   drawMenuText(msg, width / 2, y, Math.max(10, width * 0.017), [255, 236, 200]);
 }
@@ -761,18 +744,21 @@ function drawBodies() {
 
 function drawPose(pose, index) {
   const sm = [];
+  const byName = {};
   for (const kp of pose.keypoints) {
     // Per-person smoothing key so the two players don't share state.
     const p = bodySmooth.next(`${index}:${kp.name}`, kp.x, kp.y);
-    sm.push({ ...kp, x: p.x, y: p.y });
+    const s = { ...kp, x: p.x, y: p.y };
+    sm.push(s);
+    byName[s.name] = s;
   }
 
   // Subtle full-body skeleton.
   stroke(255, 255, 255, 110);
   strokeWeight(2);
   for (const [a, b] of bodyConnections) {
-    const pa = sm[a];
-    const pb = sm[b];
+    const pa = byName[a];
+    const pb = byName[b];
     if (pa && pb && kpConfidence(pa) > SCORE_THRESHOLD && kpConfidence(pb) > SCORE_THRESHOLD) {
       line(px(pa.x), pa.y, px(pb.x), pb.y);
     }
@@ -805,119 +791,183 @@ function drawStatusDot() {
   circle(14, 14, 8);
 }
 
-// --- Hands (fists) --------------------------------------------------------
+// --- Hands (wrists from body pose) ----------------------------------------
+
+// A hand counts as a punch when the wrist moves faster than this (screen px
+// per second) and is inside a character. Resting or drifting stays below it.
+const PUNCH_MIN_SPEED_RATIO = 0.65; // of the screen height per second
+const PUNCH_MEMORY_MS = 170; // a fast frame keeps the fist "hot" this long
+const GLOVE_SHOW_MS = 420; // the glove flashes in after a punch, then fades
 
 function updateHands() {
-  handStates = hands.map((hand) => handState(hand));
-}
+  const now = millis();
+  const punchSpeed = Math.max(420, height * PUNCH_MIN_SPEED_RATIO);
+  const next = [];
 
-// Smooths one hand and classifies its gesture. Kept separate from drawing so the
-// exact same (smoothed) positions are used for hit detection.
-function handState(hand) {
-  // Identify the player by wrist position relative to the center line
-  // (players stay on their own side, so side is a stable ownership cue).
-  const wristRaw = hand.keypoints.find((k) => k.name === "wrist");
-  const side = wristRaw ? (px(wristRaw.x) < width / 2 ? "L" : "R") : "?";
-  const key = `${side}:${handKey(hand)}`;
-  if (!handSmoothers[key]) handSmoothers[key] = new Smooth(0.5);
+  for (const pose of poses) {
+    const byName = {};
+    for (const kp of pose.keypoints) {
+      if (kpConfidence(kp) > SCORE_THRESHOLD) byName[kp.name] = kp;
+    }
 
-  const sm = [];
-  const byName = {};
-  for (const kp of hand.keypoints) {
-    const p = handSmoothers[key].next(kp.name, kp.x, kp.y, 100);
-    const s = { ...kp, x: p.x, y: p.y };
-    sm.push(s);
-    byName[s.name] = s;
+    const side = poseSide(byName);
+    if (!side) continue;
+
+    for (const wristName of ["left_wrist", "right_wrist"]) {
+      const wrist = byName[wristName];
+      if (!wrist) continue;
+
+      const key = `${side}:${wristName}`;
+      if (!wristSmoothers[key]) wristSmoothers[key] = new Smooth(0.7);
+
+      // Body-pose wrists are noisier than hand landmarks, so smooth them once
+      // here and reuse the same value for drawing and hit detection.
+      const s = wristSmoothers[key].next("wrist", wrist.x, wrist.y, 90);
+      const x = px(s.x);
+      const y = s.y;
+
+      let st = wristMotion[key];
+      if (!st) {
+        st = wristMotion[key] = { x, y, prevX: x, prevY: y, at: now, speed: 0, angle: 0, punchUntil: 0, gloveUntil: 0 };
+      }
+
+      const dt = (now - st.at) / 1000;
+      if (dt >= 0.008) {
+        const vx = (x - st.x) / dt;
+        const vy = (y - st.y) / dt;
+        st.speed = st.speed * 0.3 + Math.hypot(vx, vy) * 0.7;
+        st.prevX = st.x;
+        st.prevY = st.y;
+        st.x = x;
+        st.y = y;
+        st.at = now;
+      }
+
+      if (st.speed >= punchSpeed) {
+        st.punchUntil = now + PUNCH_MEMORY_MS;
+        st.gloveUntil = now + GLOVE_SHOW_MS;
+      }
+
+      const shoulder = byName[wristName === "left_wrist" ? "left_shoulder" : "right_shoulder"];
+      const raised = !!shoulder && y < shoulder.y - height * 0.04;
+
+      // Point the glove along the forearm so a raised fist reads naturally.
+      const elbow = byName[wristName === "left_wrist" ? "left_elbow" : "right_elbow"];
+      let targetAngle = 0;
+      if (elbow) targetAngle = constrain(Math.atan2(x - px(elbow.x), -(y - elbow.y)), -1.2, 1.2);
+      st.angle += (targetAngle - st.angle) * 0.25;
+
+      next.push({
+        key,
+        side,
+        limb: wristName === "left_wrist" ? "left" : "right",
+        x,
+        y,
+        prevX: st.prevX,
+        prevY: st.prevY,
+        speed: st.speed,
+        angle: st.angle,
+        punchUntil: st.punchUntil,
+        gloveUntil: st.gloveUntil,
+        raised,
+      });
+    }
   }
 
-  return { key, side, sm, byName, gesture: handGesture(byName) };
+  handStates = next;
+}
+
+// A player owns the side of the screen their torso center is on; more stable
+// than testing each wrist independently.
+function poseSide(byName) {
+  let sum = 0;
+  let n = 0;
+  for (const name of ["left_shoulder", "right_shoulder", "left_hip", "right_hip"]) {
+    const kp = byName[name];
+    if (!kp) continue;
+    sum += px(kp.x);
+    n++;
+  }
+  if (!n) return null;
+  return sum / n < width / 2 ? "L" : "R";
 }
 
 function drawHands() {
   for (const hs of handStates) drawHand(hs);
 }
 
+function gloveHeight() {
+  return Math.max(90, Math.min(320, height * 0.19));
+}
+
+// Extra reach the glove adds around the tracked wrist when hitting a muñeco.
+function gloveHitPad() {
+  return gloveHeight() * 0.22;
+}
+
 function drawHand(hs) {
-  const col = gestureColor(hs.gesture.label);
+  const now = millis();
+  const hot = now < hs.punchUntil;
+  const side = hs.side === "L" ? [255, 211, 110] : [168, 230, 207];
+  const col = hot ? [255, 64, 84] : side;
 
-  // Subtle skeleton lines.
-  stroke(col[0], col[1], col[2], 110);
-  strokeWeight(1.2);
-  for (const [a, b] of handConnections) {
-    const pa = hs.sm[a];
-    const pb = hs.sm[b];
-    if (pa && pb) line(px(pa.x), pa.y, px(pb.x), pb.y);
+  // Tracking stays visible all the time: a soft glow at the wrist.
+  if (drawingContext) {
+    drawingContext.shadowBlur = hot ? 30 : 14;
+    drawingContext.shadowColor = `rgba(${col[0]}, ${col[1]}, ${col[2]}, 0.9)`;
   }
-
-  // Small landmarks.
   noStroke();
-  fill(col[0], col[1], col[2], 180);
-  for (const kp of hs.sm) circle(px(kp.x), kp.y, 5);
-}
+  fill(col[0], col[1], col[2], hot ? 190 : 120);
+  circle(hs.x, hs.y, hot ? 44 : 34);
+  if (drawingContext) drawingContext.shadowBlur = 0;
 
-// Center of the fist: wrist plus the four knuckles. Used as the punch point.
-function fistCenter(hs) {
-  const parts = ["wrist", "index_finger_mcp", "middle_finger_mcp", "ring_finger_mcp", "pinky_mcp"];
-  let sx = 0;
-  let sy = 0;
-  let n = 0;
-  for (const name of parts) {
-    const kp = hs.byName[name];
-    if (!kp) continue;
-    sx += px(kp.x);
-    sy += kp.y;
-    n++;
-  }
-  return n ? { x: sx / n, y: sy / n } : null;
-}
-
-// Detects fist / open hand / pointing by comparing fingertip-to-wrist distance
-// against pip-to-wrist distance for each of the four fingers (not the thumb).
-function handGesture(byName) {
-  const wrist = byName["wrist"];
-  if (!wrist) return { label: "?", closed: 0, open: 0, pointing: false };
-
-  const fingers = [
-    ["index_finger_pip", "index_finger_tip", true],
-    ["middle_finger_pip", "middle_finger_tip", false],
-    ["ring_finger_pip", "ring_finger_tip", false],
-    ["pinky_pip", "pinky_tip", false],
-  ];
-
-  let closed = 0;
-  let open = 0;
-  let indexOpen = false;
-  for (const [pipName, tipName, isIndex] of fingers) {
-    const pip = byName[pipName];
-    const tip = byName[tipName];
-    if (!pip || !tip) continue;
-    const dTip = Math.hypot(tip.x - wrist.x, tip.y - wrist.y);
-    const dPip = Math.hypot(pip.x - wrist.x, pip.y - wrist.y);
-    if (dTip < dPip) {
-      closed++;
-    } else {
-      open++;
-      if (isIndex) indexOpen = true;
+  // The glove only shows up for a moment after a punch is detected.
+  const gloveLeft = (hs.gloveUntil || 0) - now;
+  if (gloveReady && gloveImg) {
+    if (gloveLeft > 0) {
+      const fade = Math.min(1, (gloveLeft / GLOVE_SHOW_MS) * 3);
+      const grow = constrain((GLOVE_SHOW_MS - gloveLeft) / 90, 0.7, 1);
+      drawGlove(hs, hot, fade, grow);
     }
+  } else {
+    // Fallback while the glove SVG loads.
+    noStroke();
+    fill(col[0], col[1], col[2], 235);
+    circle(hs.x, hs.y, hot ? 22 : 15);
   }
 
-  // Index extended with the other three curled.
-  const pointing = indexOpen && closed === 3;
-
-  let label;
-  if (pointing) label = "SEÑALANDO";
-  else if (closed >= 3) label = "PUÑO";
-  else if (open >= 3) label = "MANO ABIERTA";
-  else label = "SEMI";
-
-  return { label, closed, open, pointing };
+  // Tracking ring on top, so the exact hit point stays readable.
+  noFill();
+  stroke(col[0], col[1], col[2], hot ? 235 : 160);
+  strokeWeight(hot ? 3 : 2);
+  circle(hs.x, hs.y, 18);
 }
 
-function gestureColor(label) {
-  if (label === "SEÑALANDO") return [86, 204, 255]; // cyan
-  if (label === "PUÑO") return [255, 59, 78]; // red
-  if (label === "MANO ABIERTA") return [46, 224, 106]; // green
-  return [255, 176, 32]; // amber
+// Draws one glove half, cuff at the wrist, rotated with the forearm.
+function drawGlove(hs, hot, alpha = 1, scale = 1) {
+  const img = gloveImg;
+  const src = img.canvas || img.elt; // p5.Image draws from its canvas
+  if (!src) return;
+  const crop = hs.limb === "left" ? GLOVE_CROP.left : GLOVE_CROP.right;
+
+  const sx = crop.sx * img.width;
+  const sy = crop.sy * img.height;
+  const sw = crop.sw * img.width;
+  const sh = crop.sh * img.height;
+  if (sw <= 0 || sh <= 0) return;
+
+  const h = gloveHeight() * (hot ? 1.07 : 1) * scale;
+  const w = h * (sw / sh);
+  const dy = -h * 0.92; // the cuff sits on the tracked wrist
+  const prevAlpha = drawingContext.globalAlpha;
+
+  push();
+  translate(hs.x, hs.y);
+  rotate(hs.angle || 0);
+  drawingContext.globalAlpha = alpha;
+  drawingContext.drawImage(src, sx, sy, sw, sh, -w / 2, dy, w, h);
+  drawingContext.globalAlpha = prevAlpha;
+  pop();
 }
 
 // --- Muñecos (art characters that pop out of and back into the tree holes) -
@@ -1084,15 +1134,13 @@ function drawMuneco(m) {
 const FIST_HIT_COOLDOWN_MS = 260; // max one knockout per hand per punch
 const lastFistHitAt = {};
 
-// Any fist (left or right player) that lands on a muñeco removes it instantly and
-// spawns a placeholder impact effect.
+// Any moving fist (left or right player) that lands on a muñeco removes it
+// instantly and spawns the impact effect.
 function resolveFistHits() {
   const now = millis();
 
   for (const hs of handStates) {
-    if (hs.gesture.closed < 3 || hs.gesture.pointing) continue; // a pointing hand is not a punch
-    const fist = fistCenter(hs);
-    if (!fist) continue;
+    if (now >= hs.punchUntil) continue; // only a moving fist breaks a character
     if (now - (lastFistHitAt[hs.key] || -Infinity) < FIST_HIT_COOLDOWN_MS) continue;
 
     let best = -1;
@@ -1101,8 +1149,8 @@ function resolveFistHits() {
       const m = munecos[i];
       const p = munecoPose(m);
       if (p.scale < 0.35) continue; // still too small to be hit
-      if (!fistInsideMuneco(fist.x, fist.y, m, p)) continue;
-      const d = Math.hypot(fist.x - p.x, fist.y - p.y);
+      if (!handSweepHits(hs, m, p)) continue;
+      const d = Math.hypot(hs.x - p.x, hs.y - p.y);
       if (d < bestDist) {
         bestDist = d;
         best = i;
@@ -1124,7 +1172,18 @@ function resolveFistHits() {
   }
 }
 
-// Tests the fist point against the muñeco's rotated bounding box.
+// Sweeps the wrist from its previous to its current position so a fast punch
+// cannot tunnel through a character between two pose frames.
+function handSweepHits(hs, m, p) {
+  for (let i = 0; i <= 3; i++) {
+    const t = i / 3;
+    if (fistInsideMuneco(lerp(hs.prevX, hs.x, t), lerp(hs.prevY, hs.y, t), m, p)) return true;
+  }
+  return false;
+}
+
+// Tests the wrist point against the muñeco's rotated bounding box. The box is
+// widened by the glove radius so a visible punch connects more easily.
 function fistInsideMuneco(fx, fy, m, p) {
   const dx = fx - p.x;
   const dy = fy - p.y;
@@ -1132,7 +1191,8 @@ function fistInsideMuneco(fx, fy, m, p) {
   const s = Math.sin(-m.rotation);
   const lx = dx * c - dy * s;
   const ly = dx * s + dy * c;
-  return Math.abs(lx) <= p.w * 0.5 && Math.abs(ly) <= p.h * 0.55;
+  const pad = gloveHitPad();
+  return Math.abs(lx) <= p.w * 0.58 + pad && Math.abs(ly) <= p.h * 0.62 + pad;
 }
 
 // --- Impact effect (comic burst) ------------------------------------------
@@ -1237,12 +1297,6 @@ function px(x) {
 // ml5 renames keypoint `score` to `confidence`; read whichever is present.
 function kpConfidence(kp) {
   return kp.confidence !== undefined ? kp.confidence : kp.score;
-}
-
-function handKey(hand) {
-  const h = hand.handedness;
-  const s = typeof h === "string" ? h : h && h.label ? h.label : "";
-  return s || "h";
 }
 
 function keyPressed() {
