@@ -66,14 +66,53 @@ const handSmoothers = {}; // one smoother per hand (keyed by side + handedness)
 let munecos = [];
 let nextSpawnAt = 0;
 
-// Placeholder impact effects (expanding ring + sparks) shown when a fist hits.
+// Non-interactive characters that keep popping in and out behind the start
+// screen, so the menu always feels alive.
+let bgMunecos = [];
+let bgNextSpawnAt = 0;
+
+// Comic bursts shown where punches land.
 let effects = [];
 
 // Score per player (left / right of the divider), +10 for every character hit.
 let scores = { L: 0, R: 0 };
 
 // UI font, loaded from Google Fonts in index.html.
-const SCORE_FONT = "Mochiy Pop One";
+const UI_FONT = "Mochiy Pop One";
+
+// --- Game state and music -------------------------------------------------
+
+// "start" shows the menu; "playing" runs the game.
+let gameState = "start";
+
+// Time the four fists must be held up before the match starts.
+const START_HOLD_MS = 700;
+let startHoldMs = 0;
+
+// Three background tracks by AudioCoffee (CC BY-NC 4.0). The first one is also
+// the default src in index.html so it preloads with the page.
+const TRACKS = [
+  {
+    name: "Winter Fun",
+    url: "https://cdn.freesound.org/previews/717/717284_15232790-hq.mp3",
+  },
+  {
+    name: "Uplifting Kiddy",
+    url: "https://cdn.freesound.org/previews/815/815019_15232790-hq.mp3",
+  },
+  {
+    name: "Dreamscape",
+    url: "https://cdn.freesound.org/previews/848/848374_15232790-hq.mp3",
+  },
+];
+let trackIndex = 0;
+let bgmEl = null;
+
+// Pointing selector: hold the index fingertip over a pill to pick that song.
+const POINT_HOLD_MS = 700;
+let pointTarget = -1;
+let pointHoldMs = 0;
+let pointCooldownUntil = 0;
 
 // The 3 character portraits (Kandinsky, Shakespeare, Van Gogh), loaded async.
 const CHAR_FILES = ["kandinsky.svg", "shakespeare.svg", "vangogh.svg"];
@@ -115,7 +154,7 @@ function setup() {
 
   // Preload the UI font so the score uses it as soon as it is available.
   if (document.fonts && document.fonts.load) {
-    document.fonts.load(`16px "${SCORE_FONT}"`).catch(() => {});
+    document.fonts.load(`16px "${UI_FONT}"`).catch(() => {});
   }
 
   // Load the nature frame image asynchronously; draw it once it's ready.
@@ -133,6 +172,12 @@ function setup() {
     () => console.warn("[tracker] no cargó particulas.svg")
   );
 
+  // Preload the punch sound (a small pool so hits can overlap).
+  initHitSound();
+
+  // Grab the shared background-music element (its src is set by index.html).
+  initMusic();
+
   // ml5 1.4 returns a Promise that resolves to the model, and only the model
   // has detectStart(). Older builds return the model directly, so handle both.
   loadPoseModel(ml5.bodyPose("MoveNet", { modelType: "MULTIPOSE_LIGHTNING" }), "bodyPose", onBodyPoseReady);
@@ -141,6 +186,7 @@ function setup() {
   initCamera();
 
   nextSpawnAt = millis() + randomSpawnDelay();
+  bgNextSpawnAt = millis() + 350;
 
   // Diagnostics: warn if a model never becomes ready (network/CORS issue).
   window.setTimeout(() => {
@@ -276,17 +322,12 @@ function gotHands(results) {
 function draw() {
   background(0);
 
-  if (videoReady) {
-    // Draw the camera feed fullscreen (mirrored if requested).
-    push();
-    if (mirror) {
-      translate(width, 0);
-      scale(-1, 1);
-    }
-    image(video, coverOffX, coverOffY, videoW * coverScale, videoH * coverScale);
-    pop();
+  if (gameState === "start") {
+    drawStartScreen();
+    return;
   }
 
+  drawCameraFeed();
   if (videoReady && bodyStarted) drawBodies();
 
   // Hands are smoothed once per frame, then fist hits are resolved against the
@@ -316,6 +357,363 @@ function draw() {
   drawStatusDot();
 }
 
+// --- Camera feed (shared by the start screen and the match) ----------------
+
+function drawCameraFeed(pad = 0) {
+  if (!videoReady) return;
+  push();
+  if (mirror) {
+    translate(width, 0);
+    scale(-1, 1);
+  }
+  image(
+    video,
+    coverOffX - pad,
+    coverOffY - pad,
+    videoW * coverScale + pad * 2,
+    videoH * coverScale + pad * 2
+  );
+  pop();
+}
+
+// Canvas 2D blur. Kept in one place so it can be tuned or disabled easily.
+function setBlur(px) {
+  const ctx = drawingContext;
+  if (!ctx || !("filter" in ctx)) return;
+  ctx.filter = px > 0 ? `blur(${px}px)` : "none";
+}
+
+// --- Start screen ----------------------------------------------------------
+
+function drawStartScreen() {
+  updateBgMunecos();
+
+  // Blurred backdrop: camera + frame + the background cast, so the menu reads
+  // as a paused-but-alive version of the scene.
+  const blur = Math.max(4, width * 0.008);
+  const bleed = blur * 3;
+  setBlur(blur);
+
+  drawCameraFeed(bleed);
+
+  if (imgReady && ambientImg) {
+    image(ambientImg, -bleed, -bleed, width + bleed * 2, height + bleed * 2);
+  }
+
+  for (const m of bgMunecos) drawMuneco(m);
+
+  setBlur(0);
+
+  // Gentle dark veil over the blurred scene.
+  noStroke();
+  fill(10, 6, 16, 62);
+  rect(0, 0, width, height);
+
+  // Hands are smoothed once per frame; the same states feed the start gate.
+  if (videoReady && handStarted) {
+    updateHands();
+    drawHands();
+  }
+
+  const gate = updateStartGate();
+
+  drawStartTitle();
+
+  // Two short lines so it also fits on narrow screens.
+  const lineSize = Math.max(12, width * 0.024);
+  const line1Y = height * 0.375;
+  const line2Y = line1Y + lineSize * 1.5;
+  drawMenuText("CADA JUGADOR ACERCA", width / 2, line1Y, lineSize, [255, 246, 226]);
+  drawMenuText("SUS 2 PUÑOS A LA CÁMARA", width / 2, line2Y, lineSize, [255, 246, 226]);
+
+  // Either the fist indicators (when tracking works) or a short status line.
+  if (videoReady && handStarted) {
+    drawFistDots(gate);
+  } else {
+    drawCameraStatus(height * 0.465);
+  }
+
+  // Song picker: pills laid out first so the pointing test can use them.
+  const layout = trackPickerLayout();
+  const point = updatePointing(layout);
+  drawTrackPicker(layout, point);
+  drawPointCursor(point);
+}
+
+function drawStartTitle() {
+  push();
+  textAlign(CENTER, CENTER);
+  textFont(UI_FONT);
+  textSize(Math.max(42, width * 0.115));
+
+  // Soft shadow.
+  noStroke();
+  fill(16, 7, 14, 130);
+  text("EMPEZAR", width / 2 + 3, height * 0.255 + 5);
+
+  // Same artwork as Empezar_Texto-03.svg: Mochiy Pop One in #8a336a, with a
+  // cream edge so it stays readable over the live camera.
+  stroke(255, 243, 210);
+  strokeWeight(Math.max(5, width * 0.0095));
+  fill(138, 51, 106);
+  text("EMPEZAR", width / 2, height * 0.255);
+  pop();
+}
+
+function drawMenuText(str, x, y, size, rgb) {
+  push();
+  textAlign(CENTER, CENTER);
+  textFont(UI_FONT);
+  textSize(size);
+  noStroke();
+  fill(16, 7, 14, 140);
+  text(str, x + 1.5, y + 2);
+  fill(rgb[0], rgb[1], rgb[2]);
+  text(str, x, y);
+  pop();
+}
+
+// Reads the four hands and decides when both players are showing two fists.
+function updateStartGate() {
+  const fists = handStates.filter((hs) => hs.gesture.closed >= 3 && !hs.gesture.pointing);
+  const left = fists.filter((hs) => hs.side === "L").length;
+  const right = fists.filter((hs) => hs.side === "R").length;
+  const ready = left >= 2 && right >= 2;
+  const dt = Math.min(deltaTime, 100);
+
+  if (ready) startHoldMs += dt;
+  else startHoldMs = Math.max(0, startHoldMs - dt * 2);
+
+  if (startHoldMs >= START_HOLD_MS) startGame();
+
+  return {
+    left,
+    right,
+    ready,
+    progress: constrain(startHoldMs / START_HOLD_MS, 0, 1),
+  };
+}
+
+function drawFistDots(gate) {
+  const cx = width / 2;
+  const cy = height * 0.465;
+  const r = Math.max(6, width * 0.009);
+  const gap = r * 3.4;
+  const xs = [cx - gap * 1.65, cx - gap * 0.62, cx + gap * 0.62, cx + gap * 1.65];
+
+  const lit = [gate.left >= 1, gate.left >= 2, gate.right >= 1, gate.right >= 2];
+  const gold = [255, 211, 110];
+  const mint = [168, 230, 207];
+  const cols = [gold, gold, mint, mint];
+
+  strokeWeight(2);
+  for (let i = 0; i < 4; i++) {
+    if (lit[i]) {
+      noStroke();
+      fill(cols[i][0], cols[i][1], cols[i][2]);
+      circle(xs[i], cy, r * 2);
+    } else {
+      noFill();
+      stroke(255, 245, 220, 170);
+      circle(xs[i], cy, r * 2);
+    }
+  }
+
+  // Fill bar while the four fists are held.
+  if (gate.progress > 0) {
+    const bw = gap * 4.4;
+    const bh = Math.max(4, height * 0.006);
+    const by = cy + r * 2.4;
+    noStroke();
+    fill(255, 245, 220, 55);
+    rect(cx - bw / 2, by, bw, bh, bh / 2);
+    fill(255, 226, 138, 235);
+    rect(cx - bw / 2, by, bw * gate.progress, bh, bh / 2);
+  }
+}
+
+function drawCameraStatus(y) {
+  let msg = null;
+  if (!videoReady) msg = "ESPERANDO CÁMARA…";
+  else if (!handStarted) msg = "CARGANDO DETECCIÓN…";
+  if (!msg) return;
+  drawMenuText(msg, width / 2, y, Math.max(10, width * 0.017), [255, 236, 200]);
+}
+
+function drawTrackPicker(layout, point) {
+  const labelSize = Math.max(10, width * 0.016);
+  drawMenuText(
+    "ELEGÍ LA MÚSICA APUNTANDO CON EL DEDO",
+    width / 2,
+    layout[0].y - labelSize * 1.9,
+    labelSize,
+    [255, 240, 205]
+  );
+
+  for (let i = 0; i < layout.length; i++) {
+    const r = layout[i];
+    const selected = i === trackIndex;
+    const hovered = point && point.target === i;
+
+    push();
+    strokeWeight(2);
+    if (selected) {
+      fill(255, 211, 110, 240);
+      stroke(43, 26, 16, 230);
+    } else {
+      fill(20, 12, 20, 155);
+      stroke(255, 245, 220, 130);
+    }
+    rect(r.x, r.y, r.w, r.h, r.h / 2);
+
+    // Pointing highlight + dwell progress inside the pill.
+    if (hovered) {
+      noFill();
+      stroke(86, 204, 255, 230);
+      strokeWeight(3);
+      rect(r.x - 3, r.y - 3, r.w + 6, r.h + 6, r.h / 2 + 3);
+
+      noStroke();
+      if (selected) fill(43, 26, 16, 200);
+      else fill(255, 211, 110, 220);
+      rect(r.x + 13, r.y + r.h - 11, (r.w - 26) * point.progress, 4, 2);
+    }
+
+    noStroke();
+    if (selected) fill(43, 26, 16);
+    else fill(255, 245, 220);
+    textAlign(CENTER, CENTER);
+    textFont(UI_FONT);
+    textSize(Math.max(9, Math.min(r.h * 0.3, r.w * 0.082)));
+    text(i + 1 + "  " + TRACKS[i].name.toUpperCase(), r.x + r.w / 2, r.y + r.h / 2 + 1);
+    pop();
+  }
+}
+
+// Reads every pointing hand and accumulates dwell time over the pill under the
+// index fingertip. Holding there for POINT_HOLD_MS selects that song.
+function updatePointing(layout) {
+  const now = millis();
+  const dt = Math.min(deltaTime, 100);
+
+  // Short lockout after a pick so it does not re-trigger immediately.
+  if (now < pointCooldownUntil) {
+    return { target: -1, progress: 0, x: 0, y: 0, hand: false };
+  }
+
+  let fingertip = null;
+  let hit = -1;
+
+  for (const hs of handStates) {
+    if (!hs.gesture.pointing) continue;
+    const tip = hs.byName["index_finger_tip"];
+    if (!tip) continue;
+
+    const x = px(tip.x);
+    const y = tip.y;
+    if (!fingertip) fingertip = { x, y };
+
+    for (let i = 0; i < layout.length; i++) {
+      const r = layout[i];
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+        if (hit < 0) {
+          hit = i;
+          fingertip = { x, y };
+        }
+        break;
+      }
+    }
+  }
+
+  if (hit >= 0) {
+    if (hit === pointTarget) pointHoldMs += dt;
+    else {
+      pointTarget = hit;
+      pointHoldMs = 0;
+    }
+  } else {
+    pointTarget = -1;
+    pointHoldMs = Math.max(0, pointHoldMs - dt * 2);
+  }
+
+  if (pointTarget >= 0 && pointHoldMs >= POINT_HOLD_MS) {
+    selectTrack(pointTarget);
+    pointCooldownUntil = now + 700;
+    pointHoldMs = 0;
+    pointTarget = -1;
+    return { target: -1, progress: 0, x: fingertip ? fingertip.x : 0, y: fingertip ? fingertip.y : 0, hand: !!fingertip };
+  }
+
+  return {
+    target: pointTarget,
+    progress: pointTarget >= 0 ? constrain(pointHoldMs / POINT_HOLD_MS, 0, 1) : 0,
+    x: fingertip ? fingertip.x : 0,
+    y: fingertip ? fingertip.y : 0,
+    hand: !!fingertip,
+  };
+}
+
+function drawPointCursor(point) {
+  // Over a pill the highlight + progress bar are the feedback; the cursor is
+  // only shown while pointing at empty space.
+  if (!point.hand || point.target >= 0) return;
+  push();
+  noFill();
+  stroke(86, 204, 255, 210);
+  strokeWeight(3);
+  circle(point.x, point.y, 26);
+  noStroke();
+  fill(86, 204, 255, 240);
+  circle(point.x, point.y, 8);
+  pop();
+}
+
+// Vertical list of the three tracks, centered under the fist indicators.
+function trackPickerLayout() {
+  const ph = Math.max(34, Math.min(height * 0.052, 58));
+  const gap = ph * 0.3;
+  const pw = Math.min(width * 0.56, 460);
+  const total = ph * 3 + gap * 2;
+  // Never overflow the bottom on short screens.
+  const y0 = Math.min(height * 0.58, height - total - 24);
+  return TRACKS.map((_, i) => ({ x: (width - pw) / 2, y: y0 + i * (ph + gap), w: pw, h: ph }));
+}
+
+function startGame() {
+  gameState = "playing";
+  scores.L = 0;
+  scores.R = 0;
+  munecos.length = 0;
+  effects.length = 0;
+  bgMunecos.length = 0;
+  startHoldMs = 0;
+  for (const key in lastFistHitAt) delete lastFistHitAt[key];
+  nextSpawnAt = millis() + 700;
+  bgNextSpawnAt = millis() + 350;
+  playMusic();
+}
+
+// --- Music ----------------------------------------------------------------
+
+function initMusic() {
+  bgmEl = document.getElementById("bgm");
+}
+
+function selectTrack(i) {
+  if (i < 0 || i >= TRACKS.length) return;
+  trackIndex = i;
+  if (!bgmEl) return;
+  bgmEl.src = TRACKS[i].url;
+  bgmEl.load();
+  playMusic();
+}
+
+function playMusic() {
+  if (!bgmEl) return;
+  const p = bgmEl.play();
+  if (p && p.catch) p.catch(() => {});
+}
+
 // --- Score -----------------------------------------------------------------
 
 function drawScores() {
@@ -323,7 +721,7 @@ function drawScores() {
   const margin = Math.max(14, width * 0.035);
 
   push();
-  textFont(SCORE_FONT);
+  textFont(UI_FONT);
   textSize(size);
   textAlign(CENTER, CENTER);
 
@@ -469,40 +867,50 @@ function fistCenter(hs) {
   return n ? { x: sx / n, y: sy / n } : null;
 }
 
-// Detects fist vs open hand by comparing fingertip-to-wrist distance against
-// pip-to-wrist distance for each of the four fingers (not the thumb).
+// Detects fist / open hand / pointing by comparing fingertip-to-wrist distance
+// against pip-to-wrist distance for each of the four fingers (not the thumb).
 function handGesture(byName) {
   const wrist = byName["wrist"];
-  if (!wrist) return { label: "?", closed: 0, open: 0 };
+  if (!wrist) return { label: "?", closed: 0, open: 0, pointing: false };
 
   const fingers = [
-    ["index_finger_pip", "index_finger_tip"],
-    ["middle_finger_pip", "middle_finger_tip"],
-    ["ring_finger_pip", "ring_finger_tip"],
-    ["pinky_pip", "pinky_tip"],
+    ["index_finger_pip", "index_finger_tip", true],
+    ["middle_finger_pip", "middle_finger_tip", false],
+    ["ring_finger_pip", "ring_finger_tip", false],
+    ["pinky_pip", "pinky_tip", false],
   ];
 
   let closed = 0;
   let open = 0;
-  for (const [pipName, tipName] of fingers) {
+  let indexOpen = false;
+  for (const [pipName, tipName, isIndex] of fingers) {
     const pip = byName[pipName];
     const tip = byName[tipName];
     if (!pip || !tip) continue;
     const dTip = Math.hypot(tip.x - wrist.x, tip.y - wrist.y);
     const dPip = Math.hypot(pip.x - wrist.x, pip.y - wrist.y);
-    if (dTip < dPip) closed++;
-    else open++;
+    if (dTip < dPip) {
+      closed++;
+    } else {
+      open++;
+      if (isIndex) indexOpen = true;
+    }
   }
 
+  // Index extended with the other three curled.
+  const pointing = indexOpen && closed === 3;
+
   let label;
-  if (closed >= 3) label = "PUÑO";
+  if (pointing) label = "SEÑALANDO";
+  else if (closed >= 3) label = "PUÑO";
   else if (open >= 3) label = "MANO ABIERTA";
   else label = "SEMI";
 
-  return { label, closed, open };
+  return { label, closed, open, pointing };
 }
 
 function gestureColor(label) {
+  if (label === "SEÑALANDO") return [86, 204, 255]; // cyan
   if (label === "PUÑO") return [255, 59, 78]; // red
   if (label === "MANO ABIERTA") return [46, 224, 106]; // green
   return [255, 176, 32]; // amber
@@ -537,9 +945,26 @@ function randomSpawnDelay() {
   return random(lo, lo + 600);
 }
 
-function spawnMuneco() {
+// Background cast for the start screen: same emerge/idle/retreat cycle, but it
+// never takes hits and only lives in bgMunecos.
+function updateBgMunecos() {
+  const now = millis();
+
+  for (let i = bgMunecos.length - 1; i >= 0; i--) {
+    const m = bgMunecos[i];
+    m.age = now - m.bornAt;
+    if (m.age >= m.lifetime) bgMunecos.splice(i, 1);
+  }
+
+  if (now >= bgNextSpawnAt) {
+    spawnMuneco(bgMunecos);
+    bgNextSpawnAt = now + random(650, 1500);
+  }
+}
+
+function spawnMuneco(arr = munecos) {
   // Only use a hole that isn't already occupied (avoids overlapping designs).
-  const used = new Set(munecos.map((m) => m.hole));
+  const used = new Set(arr.map((m) => m.hole));
   const free = MUNECO_HOLES.map((_, i) => i).filter((i) => !used.has(i));
   if (free.length === 0) return;
 
@@ -576,7 +1001,7 @@ function spawnMuneco() {
   const targetX = constrain(holeX + (dx / len) * popDist, halfW, width - halfW);
   const targetY = constrain(holeY + (dy / len) * popDist, halfH, height - halfH);
 
-  munecos.push({
+  arr.push({
     type, // random character
     hole,
     h,
@@ -661,7 +1086,7 @@ function resolveFistHits() {
   const now = millis();
 
   for (const hs of handStates) {
-    if (hs.gesture.closed < 3) continue; // only a closed fist counts
+    if (hs.gesture.closed < 3 || hs.gesture.pointing) continue; // a pointing hand is not a punch
     const fist = fistCenter(hs);
     if (!fist) continue;
     if (now - (lastFistHitAt[hs.key] || -Infinity) < FIST_HIT_COOLDOWN_MS) continue;
@@ -684,6 +1109,7 @@ function resolveFistHits() {
       const m = munecos[best];
       const p = munecoPose(m);
       spawnHitEffect(p.x, p.y, m.h);
+      playHitSound(); // same instant as the burst
       munecos.splice(best, 1);
       lastFistHitAt[hs.key] = now;
 
@@ -716,9 +1142,7 @@ function spawnHitEffect(x, y, size) {
     bornAt: millis(),
     duration: 460,
   });
-}
-
-function updateEffects() {
+}function updateEffects() {
   const now = millis();
   for (let i = effects.length - 1; i >= 0; i--) {
     if (now - effects[i].bornAt >= effects[i].duration) effects.splice(i, 1);
@@ -749,6 +1173,38 @@ function drawEffects() {
   }
 
   noTint();
+}
+
+// --- Hit sound ------------------------------------------------------------
+//
+// A small pool of preloaded Audio elements so several punches can overlap and
+// each hit can restart a free voice immediately.
+
+const HIT_SOUND_URL = "golpe.mp3";
+const HIT_VOICES = 4;
+const hitVoices = [];
+let hitVoiceIndex = 0;
+
+function initHitSound() {
+  for (let i = 0; i < HIT_VOICES; i++) {
+    const a = new Audio(HIT_SOUND_URL);
+    a.preload = "auto";
+    a.volume = 0.85;
+    hitVoices.push(a);
+  }
+}
+
+function playHitSound() {
+  if (!hitVoices.length) return;
+  const a = hitVoices[hitVoiceIndex];
+  hitVoiceIndex = (hitVoiceIndex + 1) % HIT_VOICES;
+  try {
+    a.currentTime = 0;
+    const p = a.play();
+    if (p && p.catch) p.catch(() => {}); // autoplay policy: ignore until a gesture
+  } catch (err) {
+    // Never let audio break the game loop.
+  }
 }
 
 function easeOutCubic(t) {
@@ -788,4 +1244,9 @@ function handKey(hand) {
 function keyPressed() {
   if (key === "m" || key === "M") mirror = !mirror;
   if (key === "r" || key === "R") initCamera();
+
+  // Song shortcuts on the start screen (pointing is the on-screen way).
+  if (gameState === "start" && (key === "1" || key === "2" || key === "3")) {
+    selectTrack(Number(key) - 1);
+  }
 }
