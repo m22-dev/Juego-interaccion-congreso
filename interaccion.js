@@ -798,7 +798,8 @@ function drawStatusDot() {
 const PUNCH_MIN_SPEED_RATIO = 0.65; // of the screen height per second
 const PUNCH_MEMORY_MS = 170; // a fast frame keeps the fist "hot" this long
 const HAND_FADE_IN_MS = 140; // glove pops in when a hand is first seen
-const HAND_GRACE_MS = 400; // a briefly lost hand fades out instead of vanishing
+const HAND_PERSIST_MS = 15000; // a lost wrist keeps its last glove on screen
+const HAND_FADE_OUT_MS = 1500; // final fade before a stale glove is removed
 
 function updateHands() {
   const now = millis();
@@ -836,8 +837,7 @@ function updateHands() {
         };
       }
 
-      // Re-appearing after a gap fades in again instead of popping.
-      if (now - st.lastSeenAt > HAND_GRACE_MS) st.firstSeenAt = now;
+      // A re-appearing hand keeps its last glove on screen, so it never blinks.
       st.lastSeenAt = now;
       seen.add(key);
 
@@ -885,13 +885,17 @@ function updateHands() {
     }
   }
 
-  // Keep hands that just dropped out of the detection for a moment, fading
-  // them out. Without this the glove and its marker blink on every lost frame.
+  // A wrist that drops out of the detection keeps its glove where it was last
+  // seen, so the player never loses sight of their hand. The glove only fades
+  // after a long absence (or right away when the player leaves the frame).
   for (const key in wristMotion) {
     if (seen.has(key)) continue;
     const st = wristMotion[key];
     const away = now - st.lastSeenAt;
-    if (away > HAND_GRACE_MS) continue;
+    if (away > HAND_PERSIST_MS) continue;
+
+    const fadeFrom = HAND_PERSIST_MS - HAND_FADE_OUT_MS;
+    const alpha = away > fadeFrom ? (HAND_PERSIST_MS - away) / HAND_FADE_OUT_MS : 1;
 
     next.push({
       key,
@@ -905,7 +909,7 @@ function updateHands() {
       angle: st.angle,
       punchUntil: 0,
       raised: false,
-      alpha: 1 - away / HAND_GRACE_MS,
+      alpha,
       live: false,
     });
   }
