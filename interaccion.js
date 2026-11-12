@@ -82,12 +82,23 @@ const UI_FONT = "Mochiy Pop One";
 
 // --- Game state and music -------------------------------------------------
 
-// "start" shows the menu; "playing" runs the game.
+// "start" shows the menu, "roulette" spins the music pick, "playing" runs the match.
 let gameState = "start";
 
-// Time the four fists must be held up before the match starts.
+// One fist from each player must be held up before the match starts.
 const START_HOLD_MS = 700;
 let startHoldMs = 0;
+let startGate = { left: 0, right: 0, ready: false, progress: 0 };
+
+// Music roulette: after the fist gate the glow hops between the three tracks
+// with slowing steps and lands on a random winner.
+const ROULETTE_STEPS = 14;
+let rouletteStartAt = 0;
+let rouletteStep = 0;
+let rouletteIndex = 0;
+let rouletteWinner = 0;
+let rouletteLandedAt = 0;
+let rouletteSchedule = [];
 
 // Three background tracks by AudioCoffee (CC BY-NC 4.0). The first one is also
 // the default src in index.html so it preloads with the page.
@@ -105,14 +116,7 @@ const TRACKS = [
     url: "https://cdn.freesound.org/previews/848/848374_15232790-hq.mp3",
   },
 ];
-let trackIndex = 0;
 let bgmEl = null;
-
-// Pointing selector: hold the index fingertip over a pill to pick that song.
-const POINT_HOLD_MS = 700;
-let pointTarget = -1;
-let pointHoldMs = 0;
-let pointCooldownUntil = 0;
 
 // The 3 character portraits (Kandinsky, Shakespeare, Van Gogh), loaded async.
 const CHAR_FILES = ["kandinsky.svg", "shakespeare.svg", "vangogh.svg"];
@@ -322,7 +326,7 @@ function gotHands(results) {
 function draw() {
   background(0);
 
-  if (gameState === "start") {
+  if (gameState !== "playing") {
     drawStartScreen();
     return;
   }
@@ -415,48 +419,80 @@ function drawStartScreen() {
     drawHands();
   }
 
-  const gate = updateStartGate();
+  const layout = startLayout();
 
-  drawStartTitle();
+  if (gameState === "roulette") {
+    updateRoulette();
+    if (gameState !== "roulette") return; // landed: the match already began
+  } else {
+    updateStartGate();
+  }
+
+  drawStartTitle(layout);
 
   // Two short lines so it also fits on narrow screens.
-  const lineSize = Math.max(12, width * 0.024);
-  const line1Y = height * 0.375;
-  const line2Y = line1Y + lineSize * 1.5;
-  drawMenuText("CADA JUGADOR ACERCA", width / 2, line1Y, lineSize, [255, 246, 226]);
-  drawMenuText("SUS 2 PUÑOS A LA CÁMARA", width / 2, line2Y, lineSize, [255, 246, 226]);
+  drawMenuText("UN PUÑO DE CADA JUGADOR", width / 2, layout.line1Y, layout.lineSize, [255, 246, 226]);
+  drawMenuText("PARA EMPEZAR", width / 2, layout.line2Y, layout.lineSize, [255, 246, 226]);
 
   // Either the fist indicators (when tracking works) or a short status line.
   if (videoReady && handStarted) {
-    drawFistDots(gate);
+    drawFistDots(layout);
   } else {
-    drawCameraStatus(height * 0.465);
+    drawCameraStatus(layout.dotsY);
   }
 
-  // Song picker: pills laid out first so the pointing test can use them.
-  const layout = trackPickerLayout();
-  const point = updatePointing(layout);
-  drawTrackPicker(layout, point);
-  drawPointCursor(point);
+  drawTrackPicker(layout);
 }
 
-function drawStartTitle() {
+// Vertical rhythm of the menu: every gap is derived from a text size, so the
+// blocks keep the same breathing room on any screen.
+function startLayout() {
+  const lineSize = Math.max(12, width * 0.023);
+  const labelSize = Math.max(10, width * 0.016);
+  const titleSize = Math.max(42, width * 0.112);
+
+  const titleY = height * 0.235;
+  const line1Y = height * 0.365;
+  const line2Y = line1Y + lineSize * 1.7;
+  const dotsY = line2Y + lineSize * 3.2;
+
+  const ph = Math.max(34, Math.min(height * 0.052, 58));
+  const gap = ph * 0.32;
+  const pw = Math.min(width * 0.56, 460);
+  const total = ph * 3 + gap * 2;
+  const y0 = Math.min(height * 0.605, height - total - 20);
+  const pills = TRACKS.map((_, i) => ({ x: (width - pw) / 2, y: y0 + i * (ph + gap), w: pw, h: ph }));
+
+  return {
+    titleSize,
+    titleY,
+    lineSize,
+    line1Y,
+    line2Y,
+    dotsY,
+    labelSize,
+    labelY: y0 - labelSize * 2.3,
+    pills,
+  };
+}
+
+function drawStartTitle(layout) {
   push();
   textAlign(CENTER, CENTER);
   textFont(UI_FONT);
-  textSize(Math.max(42, width * 0.115));
+  textSize(layout.titleSize);
 
   // Soft shadow.
   noStroke();
   fill(16, 7, 14, 130);
-  text("EMPEZAR", width / 2 + 3, height * 0.255 + 5);
+  text("EMPEZAR", width / 2 + 3, layout.titleY + 5);
 
   // Same artwork as Empezar_Texto-03.svg: Mochiy Pop One in #8a336a, with a
   // cream edge so it stays readable over the live camera.
   stroke(255, 243, 210);
   strokeWeight(Math.max(5, width * 0.0095));
   fill(138, 51, 106);
-  text("EMPEZAR", width / 2, height * 0.255);
+  text("EMPEZAR", width / 2, layout.titleY);
   pop();
 }
 
@@ -473,62 +509,69 @@ function drawMenuText(str, x, y, size, rgb) {
   pop();
 }
 
-// Reads the four hands and decides when both players are showing two fists.
+// Reads the tracked hands and decides when both players are showing a fist.
 function updateStartGate() {
   const fists = handStates.filter((hs) => hs.gesture.closed >= 3 && !hs.gesture.pointing);
   const left = fists.filter((hs) => hs.side === "L").length;
   const right = fists.filter((hs) => hs.side === "R").length;
-  const ready = left >= 2 && right >= 2;
+  const ready = left >= 1 && right >= 1;
   const dt = Math.min(deltaTime, 100);
 
   if (ready) startHoldMs += dt;
   else startHoldMs = Math.max(0, startHoldMs - dt * 2);
 
-  if (startHoldMs >= START_HOLD_MS) startGame();
+  if (startHoldMs >= START_HOLD_MS) startRoulette();
 
-  return {
+  startGate = {
     left,
     right,
     ready,
     progress: constrain(startHoldMs / START_HOLD_MS, 0, 1),
   };
+  return startGate;
 }
 
-function drawFistDots(gate) {
+function drawFistDots(layout) {
   const cx = width / 2;
-  const cy = height * 0.465;
-  const r = Math.max(6, width * 0.009);
-  const gap = r * 3.4;
-  const xs = [cx - gap * 1.65, cx - gap * 0.62, cx + gap * 0.62, cx + gap * 1.65];
+  const cy = layout.dotsY;
+  const r = Math.max(8, width * 0.012);
+  const gap = r * 3.8;
+  const xs = [cx - gap / 2, cx + gap / 2];
 
-  const lit = [gate.left >= 1, gate.left >= 2, gate.right >= 1, gate.right >= 2];
-  const gold = [255, 211, 110];
-  const mint = [168, 230, 207];
-  const cols = [gold, gold, mint, mint];
+  const lit = [startGate.left >= 1, startGate.right >= 1];
+  const cols = [
+    [255, 211, 110], // left player: gold
+    [168, 230, 207], // right player: mint
+  ];
 
-  strokeWeight(2);
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 2; i++) {
     if (lit[i]) {
       noStroke();
+      if (drawingContext) {
+        drawingContext.shadowBlur = 12;
+        drawingContext.shadowColor = `rgba(${cols[i][0]}, ${cols[i][1]}, ${cols[i][2]}, 0.9)`;
+      }
       fill(cols[i][0], cols[i][1], cols[i][2]);
       circle(xs[i], cy, r * 2);
+      if (drawingContext) drawingContext.shadowBlur = 0;
     } else {
       noFill();
-      stroke(255, 245, 220, 170);
+      strokeWeight(2);
+      stroke(255, 245, 220, 155);
       circle(xs[i], cy, r * 2);
     }
   }
 
-  // Fill bar while the four fists are held.
-  if (gate.progress > 0) {
-    const bw = gap * 4.4;
+  // Fill bar while both fists are held.
+  if (startGate.progress > 0) {
+    const bw = gap + r * 3.4;
     const bh = Math.max(4, height * 0.006);
-    const by = cy + r * 2.4;
+    const by = cy + r * 2.2;
     noStroke();
-    fill(255, 245, 220, 55);
+    fill(255, 245, 220, 50);
     rect(cx - bw / 2, by, bw, bh, bh / 2);
-    fill(255, 226, 138, 235);
-    rect(cx - bw / 2, by, bw * gate.progress, bh, bh / 2);
+    fill(255, 226, 138, 240);
+    rect(cx - bw / 2, by, bw * startGate.progress, bh, bh / 2);
   }
 }
 
@@ -540,146 +583,102 @@ function drawCameraStatus(y) {
   drawMenuText(msg, width / 2, y, Math.max(10, width * 0.017), [255, 236, 200]);
 }
 
-function drawTrackPicker(layout, point) {
-  const labelSize = Math.max(10, width * 0.016);
-  drawMenuText(
-    "ELEGÍ LA MÚSICA APUNTANDO CON EL DEDO",
-    width / 2,
-    layout[0].y - labelSize * 1.9,
-    labelSize,
-    [255, 240, 205]
-  );
+function drawTrackPicker(layout) {
+  const spinning = gameState === "roulette";
+  const landed = spinning && rouletteStep >= rouletteSchedule.length;
+  const active = spinning ? rouletteIndex : -1;
 
-  for (let i = 0; i < layout.length; i++) {
-    const r = layout[i];
-    const selected = i === trackIndex;
-    const hovered = point && point.target === i;
+  let label = "LA MÚSICA SE ELIGE AL AZAR";
+  if (spinning) label = landed ? "¡MÚSICA ELEGIDA!" : "ELIGIENDO MÚSICA…";
+  drawMenuText(label, width / 2, layout.labelY, layout.labelSize, [255, 240, 205]);
+
+  for (let i = 0; i < layout.pills.length; i++) {
+    const r = layout.pills[i];
+    const isActive = i === active;
+    const isWinner = landed && i === rouletteWinner;
 
     push();
     strokeWeight(2);
-    if (selected) {
-      fill(255, 211, 110, 240);
-      stroke(43, 26, 16, 230);
+
+    if (isActive || isWinner) {
+      // Warm glow, pulsing while the roulette is still running.
+      if (drawingContext) {
+        const pulse = 0.5 + 0.5 * Math.sin(millis() / 85);
+        drawingContext.shadowBlur = isWinner ? 34 : 16 + pulse * 20;
+        drawingContext.shadowColor = "rgba(255, 205, 96, 0.95)";
+      }
+      fill(255, 211, 110, 245);
+      stroke(255, 252, 240, 240);
     } else {
-      fill(20, 12, 20, 155);
-      stroke(255, 245, 220, 130);
+      fill(20, 12, 20, 148);
+      stroke(255, 245, 220, 110);
     }
+
     rect(r.x, r.y, r.w, r.h, r.h / 2);
-
-    // Pointing highlight + dwell progress inside the pill.
-    if (hovered) {
-      noFill();
-      stroke(86, 204, 255, 230);
-      strokeWeight(3);
-      rect(r.x - 3, r.y - 3, r.w + 6, r.h + 6, r.h / 2 + 3);
-
-      noStroke();
-      if (selected) fill(43, 26, 16, 200);
-      else fill(255, 211, 110, 220);
-      rect(r.x + 13, r.y + r.h - 11, (r.w - 26) * point.progress, 4, 2);
-    }
+    if (drawingContext) drawingContext.shadowBlur = 0;
 
     noStroke();
-    if (selected) fill(43, 26, 16);
+    if (isActive || isWinner) fill(43, 26, 16);
     else fill(255, 245, 220);
     textAlign(CENTER, CENTER);
     textFont(UI_FONT);
-    textSize(Math.max(9, Math.min(r.h * 0.3, r.w * 0.082)));
-    text(i + 1 + "  " + TRACKS[i].name.toUpperCase(), r.x + r.w / 2, r.y + r.h / 2 + 1);
+    textSize(Math.max(9, Math.min(r.h * 0.32, r.w * 0.082)));
+    text(TRACKS[i].name.toUpperCase(), r.x + r.w / 2, r.y + r.h / 2 + 1);
     pop();
   }
 }
 
-// Reads every pointing hand and accumulates dwell time over the pill under the
-// index fingertip. Holding there for POINT_HOLD_MS selects that song.
-function updatePointing(layout) {
+// Builds a random hop schedule that slows down towards the end and always
+// finishes on the pre-picked winner.
+function startRoulette() {
+  gameState = "roulette";
+  startHoldMs = 0;
+  rouletteWinner = Math.floor(random(TRACKS.length));
+  rouletteStep = 0;
+  rouletteIndex = 0;
+  rouletteLandedAt = 0;
+  rouletteStartAt = millis();
+  rouletteSchedule = [];
+
+  let t = 0;
+  let prev = 0;
+  for (let i = 0; i < ROULETTE_STEPS; i++) {
+    const k = i / (ROULETTE_STEPS - 1);
+    t += lerp(70, 330, k * k * k); // longer waits as it decelerates
+
+    let idx;
+    if (i === ROULETTE_STEPS - 1) {
+      idx = rouletteWinner;
+    } else {
+      idx = Math.floor(random(TRACKS.length));
+      // Never repeat the same pill twice in a row.
+      if (idx === prev) idx = (idx + 1 + Math.floor(random(TRACKS.length - 1))) % TRACKS.length;
+    }
+
+    prev = idx;
+    rouletteSchedule.push({ at: t, index: idx });
+  }
+}
+
+function updateRoulette() {
   const now = millis();
-  const dt = Math.min(deltaTime, 100);
+  const elapsed = now - rouletteStartAt;
 
-  // Short lockout after a pick so it does not re-trigger immediately.
-  if (now < pointCooldownUntil) {
-    return { target: -1, progress: 0, x: 0, y: 0, hand: false };
+  while (rouletteStep < rouletteSchedule.length && elapsed >= rouletteSchedule[rouletteStep].at) {
+    rouletteIndex = rouletteSchedule[rouletteStep].index;
+    rouletteStep++;
   }
 
-  let fingertip = null;
-  let hit = -1;
-
-  for (const hs of handStates) {
-    if (!hs.gesture.pointing) continue;
-    const tip = hs.byName["index_finger_tip"];
-    if (!tip) continue;
-
-    const x = px(tip.x);
-    const y = tip.y;
-    if (!fingertip) fingertip = { x, y };
-
-    for (let i = 0; i < layout.length; i++) {
-      const r = layout[i];
-      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
-        if (hit < 0) {
-          hit = i;
-          fingertip = { x, y };
-        }
-        break;
-      }
+  if (rouletteStep >= rouletteSchedule.length) {
+    if (!rouletteLandedAt) rouletteLandedAt = now;
+    if (now - rouletteLandedAt >= 900) {
+      selectTrack(rouletteWinner);
+      beginMatch();
     }
   }
-
-  if (hit >= 0) {
-    if (hit === pointTarget) pointHoldMs += dt;
-    else {
-      pointTarget = hit;
-      pointHoldMs = 0;
-    }
-  } else {
-    pointTarget = -1;
-    pointHoldMs = Math.max(0, pointHoldMs - dt * 2);
-  }
-
-  if (pointTarget >= 0 && pointHoldMs >= POINT_HOLD_MS) {
-    selectTrack(pointTarget);
-    pointCooldownUntil = now + 700;
-    pointHoldMs = 0;
-    pointTarget = -1;
-    return { target: -1, progress: 0, x: fingertip ? fingertip.x : 0, y: fingertip ? fingertip.y : 0, hand: !!fingertip };
-  }
-
-  return {
-    target: pointTarget,
-    progress: pointTarget >= 0 ? constrain(pointHoldMs / POINT_HOLD_MS, 0, 1) : 0,
-    x: fingertip ? fingertip.x : 0,
-    y: fingertip ? fingertip.y : 0,
-    hand: !!fingertip,
-  };
 }
 
-function drawPointCursor(point) {
-  // Over a pill the highlight + progress bar are the feedback; the cursor is
-  // only shown while pointing at empty space.
-  if (!point.hand || point.target >= 0) return;
-  push();
-  noFill();
-  stroke(86, 204, 255, 210);
-  strokeWeight(3);
-  circle(point.x, point.y, 26);
-  noStroke();
-  fill(86, 204, 255, 240);
-  circle(point.x, point.y, 8);
-  pop();
-}
-
-// Vertical list of the three tracks, centered under the fist indicators.
-function trackPickerLayout() {
-  const ph = Math.max(34, Math.min(height * 0.052, 58));
-  const gap = ph * 0.3;
-  const pw = Math.min(width * 0.56, 460);
-  const total = ph * 3 + gap * 2;
-  // Never overflow the bottom on short screens.
-  const y0 = Math.min(height * 0.58, height - total - 24);
-  return TRACKS.map((_, i) => ({ x: (width - pw) / 2, y: y0 + i * (ph + gap), w: pw, h: ph }));
-}
-
-function startGame() {
+function beginMatch() {
   gameState = "playing";
   scores.L = 0;
   scores.R = 0;
@@ -690,18 +689,23 @@ function startGame() {
   for (const key in lastFistHitAt) delete lastFistHitAt[key];
   nextSpawnAt = millis() + 700;
   bgNextSpawnAt = millis() + 350;
-  playMusic();
 }
 
 // --- Music ----------------------------------------------------------------
 
 function initMusic() {
   bgmEl = document.getElementById("bgm");
+
+  // Warm the cache for the other tracks so the roulette winner starts fast.
+  for (let i = 1; i < TRACKS.length; i++) {
+    const a = new Audio();
+    a.preload = "auto";
+    a.src = TRACKS[i].url;
+  }
 }
 
 function selectTrack(i) {
   if (i < 0 || i >= TRACKS.length) return;
-  trackIndex = i;
   if (!bgmEl) return;
   bgmEl.src = TRACKS[i].url;
   bgmEl.load();
@@ -1244,9 +1248,4 @@ function handKey(hand) {
 function keyPressed() {
   if (key === "m" || key === "M") mirror = !mirror;
   if (key === "r" || key === "R") initCamera();
-
-  // Song shortcuts on the start screen (pointing is the on-screen way).
-  if (gameState === "start" && (key === "1" || key === "2" || key === "3")) {
-    selectTrack(Number(key) - 1);
-  }
 }
