@@ -6,6 +6,7 @@
 // wrist motion, so the game reacts on the very first fast frame.
 
 const SCORE_THRESHOLD = 0.3; // minimum confidence for a body keypoint
+const WRIST_MIN_CONFIDENCE = 0.18; // hands are tracked even in low-confidence poses
 
 const CAM_W = 1280;
 const CAM_H = 720;
@@ -78,8 +79,15 @@ const UI_FONT = "Mochiy Pop One";
 
 // --- Game state and music -------------------------------------------------
 
-// "start" shows the menu, "roulette" spins the music pick, "playing" runs the match.
+// "start" shows the menu, "roulette" spins the music pick, "playing" runs the
+// match and "over" shows the final screen.
 let gameState = "start";
+
+// 30 seconds per match; the end screen returns to the menu by itself.
+const MATCH_MS = 30000;
+let matchEndAt = 0;
+const END_SCREEN_MS = 5000;
+let endScreenAt = 0;
 
 // One fist from each player must be held up before the match starts.
 const START_HOLD_MS = 700;
@@ -124,8 +132,13 @@ function charAspect(type) {
   return img && img.height ? img.width / img.height : 0.793;
 }
 
-let ambientImg;
-let imgReady = false;
+// Two ambient layers: the back one only holds the dark knots (the holes) and
+// the front one is the trunk frame. Characters are drawn in between so they
+// come out of the holes from behind the trunk.
+let backImg;
+let backReady = false;
+let frontImg;
+let frontReady = false;
 
 // Comic burst shown where a punch lands (PARTICULAS-02.svg, copied as particulas.svg).
 let burstImg;
@@ -139,22 +152,33 @@ const GLOVE_CROP = {
   right: { sx: 0.5451, sy: 0.0043, sw: 0.4549, sh: 0.9957 },
 };
 
-// The tree holes (normalized to the SVG viewBox 2573.89 x 1562.94) that the
-// muñecos pop out of. Centers measured from the dark knothole paths in the art:
-// 2 left, 1 right-upper, and 2 at the bottom.
+// The corrected front layer is already narrow, so it is drawn 1:1. The value is
+// kept as a knob in case the frame needs to be cropped or widened later.
+const AMBIENT_ZOOM = 1;
+
+// Maps an x from the SVG viewBox into the on-screen frame.
+function artToScreenX(nx) {
+  return 0.5 + (nx - 0.5) * AMBIENT_ZOOM;
+}
+
+// Muñeco spawn holes in SVG space (0..1 of the 2560x1540 viewBox). They are
+// replaced by the color detection that runs when the back layer loads; these
+// are the values measured from the art as a fallback.
 const MUNECO_HOLES = [
-  { x: 0.02343, y: 0.37366 }, // left-upper
-  { x: 0.08561, y: 0.55773 }, // left-lower
-  { x: 0.96657, y: 0.35916 }, // right-upper
-  { x: 0.29716, y: 0.79254 }, // bottom-left
-  { x: 0.66974, y: 0.83954 }, // bottom-right
+  { x: 0.1043, y: 0.3556 }, // left
+  { x: 0.9718, y: 0.3616 }, // right
+  { x: 0.2987, y: 0.7664 }, // bottom-left
+  { x: 0.6722, y: 0.8195 }, // bottom-right
 ];
 
-// Rotation for a hole based on its side: left = +90°, right = -90°, bottom = 0°.
-function holeRotation(x) {
-  if (x < 0.2) return HALF_PI; // left side, clockwise
-  if (x > 0.8) return -HALF_PI; // right side, counterclockwise
-  return 0; // bottom, head up
+// Detected by color in the back layer, so the spawn is exactly at the knot.
+const HOLE_COLOR = [90, 53, 32]; // #5A3520
+const HOLE_TOLERANCE = 24;
+
+// Rotation for a hole: side holes are rotated sideways, bottom ones stand up.
+function holeRotation(hole) {
+  if (hole.y > 0.7) return 0; // bottom, head up
+  return hole.x < 0.5 ? HALF_PI : -HALF_PI; // left clockwise, right counterclockwise
 }
 
 function setup() {
@@ -166,8 +190,9 @@ function setup() {
     document.fonts.load(`16px "${UI_FONT}"`).catch(() => {});
   }
 
-  // Load the nature frame image asynchronously; draw it once it's ready.
-  loadImage("ambiente.svg", onImageLoaded, onImageError);
+  // Load the two ambient layers: knots (back) and trunk frame (front).
+  loadImage("ambiente-fondo.svg", onBackLoaded, onBackError);
+  loadImage("ambiente-frente.svg", onFrontLoaded, onFrontError);
 
   // Load the 3 character SVGs.
   CHAR_FILES.forEach((f, i) => {
@@ -247,14 +272,169 @@ function updateCoverTransform() {
   }
 }
 
-function onImageLoaded(img) {
-  ambientImg = img; // p5 2.x delivers the real image via the callback
-  imgReady = true;
-  console.log("[tracker] ambiente cargado", img.width, "x", img.height);
+function onBackLoaded(img) {
+  backImg = img;
+  backReady = true;
+  detectHoles(img);
+  console.log("[tracker] capa fondo cargada", img.width, "x", img.height);
 }
 
-function onImageError() {
-  console.warn("[tracker] no se pudo cargar ambiente.svg");
+function onBackError() {
+  console.warn("[tracker] no se pudo cargar ambiente-fondo.svg");
+}
+
+function onFrontLoaded(img) {
+  frontImg = img;
+  frontReady = true;
+  buildFrontMask(img);
+  console.log("[tracker] capa frente cargada", img.width, "x", img.height);
+}
+
+function onFrontError() {
+  console.warn("[tracker] no se pudo cargar ambiente-frente.svg");
+}
+
+// Low-res alpha map of the front layer. Used to place each character just past
+// the trunk so it ends fully visible and centered on its hole.
+let frontMask = null;
+
+function buildFrontMask(img) {
+  const W = 320;
+  const H = Math.max(1, Math.round((W * img.height) / img.width));
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img.canvas || img.elt, 0, 0, W, H);
+
+  const d = ctx.getImageData(0, 0, W, H).data;
+  const m = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) m[i] = d[i * 4 + 3] > 8 ? 1 : 0;
+  frontMask = { w: W, h: H, m };
+}
+
+function frontOpaqueAt(nx, ny) {
+  if (!frontMask) return false;
+  const x = Math.round(nx * (frontMask.w - 1));
+  const y = Math.round(ny * (frontMask.h - 1));
+  if (x < 0 || y < 0 || x >= frontMask.w || y >= frontMask.h) return false;
+  return frontMask.m[y * frontMask.w + x] === 1;
+}
+
+// Distance (screen px) until the front layer opens up along (dx, dy). Returns
+// the first point where it stays transparent for a few px, or null.
+function frontClearDistance(x, y, dx, dy, maxPx) {
+  if (!frontMask) return null;
+  const layerW = width * AMBIENT_ZOOM;
+  const ox = (width - layerW) / 2;
+
+  let free = 0;
+  for (let d = 0; d <= maxPx; d += 4) {
+    const nx = (x + dx * d - ox) / layerW;
+    const ny = (y + dy * d) / height;
+    if (frontOpaqueAt(nx, ny)) {
+      free = 0;
+    } else {
+      free += 4;
+      if (free >= 14) return d - free + 4;
+    }
+  }
+  return null;
+}
+
+// Finds the dark knots in the back layer by color and stores their centroids,
+// so the muñecos come out of the exact center of each hole.
+function detectHoles(img) {
+  const src = img.canvas || img.elt;
+  if (!src) return;
+
+  const W = 320;
+  const H = Math.max(1, Math.round((W * img.height) / img.width));
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(src, 0, 0, W, H);
+
+  let data;
+  try {
+    data = ctx.getImageData(0, 0, W, H).data;
+  } catch (e) {
+    console.warn("[tracker] no se pudo leer la capa fondo", e);
+    return;
+  }
+
+  const mask = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    if (data[i * 4 + 3] < 200) continue;
+    if (
+      Math.abs(data[i * 4] - HOLE_COLOR[0]) <= HOLE_TOLERANCE &&
+      Math.abs(data[i * 4 + 1] - HOLE_COLOR[1]) <= HOLE_TOLERANCE &&
+      Math.abs(data[i * 4 + 2] - HOLE_COLOR[2]) <= HOLE_TOLERANCE
+    ) {
+      mask[i] = 1;
+    }
+  }
+
+  const seen = new Uint8Array(W * H);
+  const blobs = [];
+  const stack = [];
+
+  for (let start = 0; start < W * H; start++) {
+    if (!mask[start] || seen[start]) continue;
+    stack.length = 0;
+    stack.push(start);
+    seen[start] = 1;
+
+    let sx = 0;
+    let sy = 0;
+    let n = 0;
+
+    while (stack.length) {
+      const p = stack.pop();
+      const x = p % W;
+      const y = (p / W) | 0;
+      sx += x;
+      sy += y;
+      n++;
+
+      if (x > 0 && mask[p - 1] && !seen[p - 1]) { seen[p - 1] = 1; stack.push(p - 1); }
+      if (x < W - 1 && mask[p + 1] && !seen[p + 1]) { seen[p + 1] = 1; stack.push(p + 1); }
+      if (y > 0 && mask[p - W] && !seen[p - W]) { seen[p - W] = 1; stack.push(p - W); }
+      if (y < H - 1 && mask[p + W] && !seen[p + W]) { seen[p + W] = 1; stack.push(p + W); }
+    }
+
+    if (n < 40) continue; // ignore antialiasing specks
+    blobs.push({ x: sx / n / W, y: sy / n / H, area: n });
+  }
+
+  // Merge knots that are almost on top of each other (the art repeats a path).
+  const holes = [];
+  for (const b of blobs) {
+    const near = holes.find((h) => Math.hypot(h.x - b.x, h.y - b.y) < 0.03);
+    if (!near) {
+      holes.push({ ...b });
+      continue;
+    }
+    const total = near.area + b.area;
+    near.x = (near.x * near.area + b.x * b.area) / total;
+    near.y = (near.y * near.area + b.y * b.area) / total;
+    near.area = total;
+  }
+
+  if (!holes.length) {
+    console.warn("[tracker] no se detectaron agujeros, se usan los de reserva");
+    return;
+  }
+
+  holes.sort((a, b) => a.y - b.y || a.x - b.x);
+  MUNECO_HOLES.length = 0;
+  for (const h of holes) MUNECO_HOLES.push({ x: h.x, y: h.y });
+
+  console.log(
+    "[tracker] agujeros detectados:",
+    holes.map((h) => `${(h.x * 100).toFixed(1)},${(h.y * 100).toFixed(1)}`).join(" | ")
+  );
 }
 
 // --- Readiness (body pose drives the hands) -------------------------------
@@ -309,8 +489,20 @@ function gotPoses(results) {
 function draw() {
   background(0);
 
+  if (gameState === "over") {
+    drawEndScreen();
+    return;
+  }
+
   if (gameState !== "playing") {
     drawStartScreen();
+    return;
+  }
+
+  // The match runs for MATCH_MS, then the final screen takes over.
+  if (millis() >= matchEndAt) {
+    endMatch();
+    drawEndScreen();
     return;
   }
 
@@ -325,14 +517,11 @@ function draw() {
   if (videoReady && bodyStarted) resolveFistHits();
   updateEffects();
 
-  if (videoReady && bodyStarted) drawHands();
-
-  // Nature frame first, then the muñecos on top so the trunk never covers them.
-  if (imgReady && ambientImg) {
-    image(ambientImg, 0, 0, width, height);
-  }
-
+  // Layer order: holes (back), muñecos, trunk frame (front), gloves on top.
+  drawBackLayer();
   drawMunecos();
+  drawFrontLayer();
+  if (videoReady && bodyStarted) drawHands();
 
   // Impact feedback stays visible over the frame.
   drawEffects();
@@ -340,6 +529,7 @@ function draw() {
   if (videoReady) drawDivider();
 
   drawScores();
+  drawTimer();
 
   drawStatusDot();
 }
@@ -370,26 +560,43 @@ function setBlur(px) {
   ctx.filter = px > 0 ? `blur(${px}px)` : "none";
 }
 
+// Both ambient layers share the same transform so the knots line up with the
+// trunk openings.
+function drawAmbientLayer(img, pad) {
+  const w = width * AMBIENT_ZOOM;
+  const x = (width - w) / 2;
+  image(img, x - pad, -pad, w + pad * 2, height + pad * 2);
+}
+
+// Back layer: only the dark knots (the holes).
+function drawBackLayer(pad = 0) {
+  if (backReady && backImg) drawAmbientLayer(backImg, pad);
+}
+
+// Front layer: the trunk frame that hides the muñecos while they come out.
+function drawFrontLayer(pad = 0) {
+  if (frontReady && frontImg) drawAmbientLayer(frontImg, pad);
+}
+
 // --- Start screen ----------------------------------------------------------
+
+// Blurred scene behind the menu and the final screen.
+function drawMenuBackdrop(blur) {
+  const bleed = blur * 3;
+  setBlur(blur);
+  drawCameraFeed(bleed);
+  drawBackLayer(bleed);
+  for (const m of bgMunecos) drawMuneco(m);
+  drawFrontLayer(bleed);
+  setBlur(0);
+}
 
 function drawStartScreen() {
   updateBgMunecos();
 
   // Blurred backdrop: camera + frame + the background cast, so the menu reads
   // as a paused-but-alive version of the scene.
-  const blur = Math.max(4, width * 0.008);
-  const bleed = blur * 3;
-  setBlur(blur);
-
-  drawCameraFeed(bleed);
-
-  if (imgReady && ambientImg) {
-    image(ambientImg, -bleed, -bleed, width + bleed * 2, height + bleed * 2);
-  }
-
-  for (const m of bgMunecos) drawMuneco(m);
-
-  setBlur(0);
+  drawMenuBackdrop(Math.max(4, width * 0.008));
 
   // Gentle dark veil over the blurred scene.
   noStroke();
@@ -427,23 +634,28 @@ function drawStartScreen() {
   drawTrackPicker(layout);
 }
 
-// Vertical rhythm of the menu: every gap is derived from a text size, so the
-// blocks keep the same breathing room on any screen.
+// Vertical rhythm of the menu: the same breathing room between the title, the
+// instructions and the music label, derived from the text sizes.
 function startLayout() {
   const lineSize = Math.max(12, width * 0.023);
   const labelSize = Math.max(10, width * 0.016);
   const titleSize = Math.max(42, width * 0.112);
 
-  const titleY = height * 0.235;
-  const line1Y = height * 0.365;
-  const line2Y = line1Y + lineSize * 1.7;
-  const dotsY = line2Y + lineSize * 3.2;
+  const blockGap = Math.max(26, height * 0.055);
+
+  const titleY = height * 0.205;
+  const titleBottom = titleY + titleSize * 0.78;
+  const line1Y = titleBottom + blockGap + lineSize * 0.5;
+  const line2Y = line1Y + lineSize * 1.55;
+  const dotsY = line2Y + lineSize * 1.55;
+  const labelY = dotsY + blockGap + labelSize * 0.5;
 
   const ph = Math.max(34, Math.min(height * 0.052, 58));
   const gap = ph * 0.32;
   const pw = Math.min(width * 0.56, 460);
   const total = ph * 3 + gap * 2;
-  const y0 = Math.min(height * 0.605, height - total - 20);
+  let y0 = labelY + labelSize * 0.5 + blockGap * 0.55;
+  y0 = Math.min(y0, height - total - 20);
   const pills = TRACKS.map((_, i) => ({ x: (width - pw) / 2, y: y0 + i * (ph + gap), w: pw, h: ph }));
 
   return {
@@ -454,9 +666,77 @@ function startLayout() {
     line2Y,
     dotsY,
     labelSize,
-    labelY: y0 - labelSize * 2.3,
+    labelY: Math.min(labelY, y0 - labelSize * 1.2),
     pills,
   };
+}
+
+// --- Final screen ---------------------------------------------------------
+
+// Shown when the 30 s match ends; it returns to the menu after END_SCREEN_MS.
+function drawEndScreen() {
+  const now = millis();
+  if (now - endScreenAt >= END_SCREEN_MS) {
+    resetToStart();
+    return;
+  }
+
+  updateBgMunecos();
+  drawMenuBackdrop(Math.max(4, width * 0.008));
+
+  // Darker veil so the final text reads clearly.
+  noStroke();
+  fill(10, 6, 16, 105);
+  rect(0, 0, width, height);
+
+  if (videoReady && bodyStarted) {
+    updateHands();
+    drawHands();
+  }
+
+  drawFinalTitle();
+
+  const size = Math.max(20, width * 0.03);
+  drawMenuText("IZQUIERDA " + scores.L, width / 2, height * 0.575, size, [255, 211, 110]);
+  drawMenuText("DERECHA " + scores.R, width / 2, height * 0.575 + size * 1.7, size, [168, 230, 207]);
+
+  const left = Math.ceil(Math.max(0, END_SCREEN_MS - (now - endScreenAt)) / 1000);
+  drawMenuText(
+    "VOLVIENDO AL INICIO EN " + left,
+    width / 2,
+    height * 0.76,
+    Math.max(10, width * 0.016),
+    [255, 246, 226]
+  );
+}
+
+function drawFinalTitle() {
+  push();
+  textAlign(CENTER, CENTER);
+  textFont(UI_FONT);
+
+  // Same look as JuegoTerminado_Texto-04.svg: Mochiy Pop One in #40646e with a
+  // cream edge. Drawn as text so the page webfont is used.
+  let size = Math.max(28, width * 0.072);
+  textSize(size);
+  const maxW = width * 0.9;
+  const tw = textWidth("JUEGO TERMINADO");
+  if (tw > maxW) {
+    size *= maxW / tw;
+    textSize(size);
+  }
+
+  const y = height * 0.34;
+
+  noStroke();
+  fill(16, 7, 14, 130);
+  text("JUEGO TERMINADO", width / 2 + 3, y + 5);
+
+  stroke(255, 243, 210);
+  strokeWeight(Math.max(5, width * 0.008));
+  fill(64, 100, 110);
+  text("JUEGO TERMINADO", width / 2, y);
+  pop();
 }
 
 function drawStartTitle(layout) {
@@ -672,6 +952,29 @@ function beginMatch() {
   for (const key in lastFistHitAt) delete lastFistHitAt[key];
   nextSpawnAt = millis() + 700;
   bgNextSpawnAt = millis() + 350;
+  matchEndAt = millis() + MATCH_MS;
+}
+
+// Ends the match and shows the final screen.
+function endMatch() {
+  gameState = "over";
+  endScreenAt = millis();
+  munecos.length = 0;
+  effects.length = 0;
+  stopMusic();
+}
+
+// Back to the menu, ready for a new round.
+function resetToStart() {
+  gameState = "start";
+  scores.L = 0;
+  scores.R = 0;
+  munecos.length = 0;
+  effects.length = 0;
+  bgMunecos.length = 0;
+  startHoldMs = 0;
+  bgNextSpawnAt = millis() + 350;
+  endScreenAt = 0;
 }
 
 // --- Music ----------------------------------------------------------------
@@ -699,6 +1002,16 @@ function playMusic() {
   if (!bgmEl) return;
   const p = bgmEl.play();
   if (p && p.catch) p.catch(() => {});
+}
+
+function stopMusic() {
+  if (!bgmEl) return;
+  bgmEl.pause();
+  try {
+    bgmEl.currentTime = 0;
+  } catch (e) {
+    // Some browsers refuse to seek before the metadata is ready.
+  }
 }
 
 // --- Score -----------------------------------------------------------------
@@ -734,6 +1047,40 @@ function drawScore(value, x, y, rgb) {
   text(value, x, y);
 
   noStroke();
+}
+
+// Small clock pill at the top center with the time left in the match.
+function drawTimer() {
+  const remain = Math.max(0, matchEndAt - millis());
+  const secs = Math.ceil(remain / 1000);
+  const label = Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
+
+  const size = Math.max(18, width * 0.03);
+  const cx = width / 2;
+  const cy = Math.max(30, height * 0.05);
+
+  push();
+  textFont(UI_FONT);
+  textAlign(CENTER, CENTER);
+  textSize(size);
+
+  const w = textWidth(label) + size * 1.9;
+  const h = size * 1.8;
+
+  noStroke();
+  fill(20, 12, 20, 150);
+  rect(cx - w / 2, cy - h / 2, w, h, h / 2);
+
+  // Red pulse for the last 10 seconds.
+  const low = remain <= 10000;
+  const pulse = low ? 0.7 + 0.3 * Math.sin(millis() / 110) : 1;
+  const col = low ? [255, 104, 96] : [255, 246, 226];
+
+  stroke(43, 26, 16, 200);
+  strokeWeight(Math.max(3, width * 0.004));
+  fill(col[0], col[1], col[2], 255 * pulse);
+  text(label, cx, cy + 1);
+  pop();
 }
 
 // --- Body (subtle skeleton, up to 2 people) -------------------------------
@@ -810,10 +1157,14 @@ function updateHands() {
   for (const pose of poses) {
     const byName = {};
     for (const kp of pose.keypoints) {
-      if (kpConfidence(kp) > SCORE_THRESHOLD) byName[kp.name] = kp;
+      // Wrists accept a lower confidence so the hands are tracked in any
+      // position, not only when they are raised in front of the body.
+      const min = kp.name.endsWith("_wrist") ? WRIST_MIN_CONFIDENCE : SCORE_THRESHOLD;
+      if (kpConfidence(kp) > min) byName[kp.name] = kp;
     }
 
-    const side = poseSide(byName);
+    const anyWrist = byName["left_wrist"] || byName["right_wrist"];
+    const side = poseSide(byName, anyWrist ? anyWrist.x : undefined);
     if (!side) continue;
 
     for (const wristName of ["left_wrist", "right_wrist"]) {
@@ -918,8 +1269,9 @@ function updateHands() {
 }
 
 // A player owns the side of the screen their torso center is on; more stable
-// than testing each wrist independently.
-function poseSide(byName) {
+// than testing each wrist independently. If the torso is not visible, fall back
+// to the wrist itself so a close-up hand still works.
+function poseSide(byName, fallbackX) {
   let sum = 0;
   let n = 0;
   for (const name of ["left_shoulder", "right_shoulder", "left_hip", "right_hip"]) {
@@ -928,7 +1280,10 @@ function poseSide(byName) {
     sum += px(kp.x);
     n++;
   }
-  if (!n) return null;
+  if (!n) {
+    if (fallbackX === undefined) return null;
+    return px(fallbackX) < width / 2 ? "L" : "R";
+  }
   return sum / n < width / 2 ? "L" : "R";
 }
 
@@ -937,7 +1292,7 @@ function drawHands() {
 }
 
 function gloveHeight() {
-  return Math.max(90, Math.min(320, height * 0.19));
+  return Math.max(100, Math.min(340, height * 0.215));
 }
 
 // Extra reach the glove adds around the tracked wrist when hitting a muñeco.
@@ -1064,35 +1419,39 @@ function spawnMuneco(arr = munecos) {
   const hole = free[Math.floor(random(free.length))];
   const spawn = MUNECO_HOLES[hole];
   const type = Math.floor(random(CHAR_FILES.length));
-  const h = height * random(0.14, 0.18); // character height (~14-18% of screen)
+  const h = height * random(0.16, 0.21); // character height (~16-21% of screen)
   const w = h * charAspect(type);
-  const popDuration = 380;
+  const popDuration = 700;
   // +1s of extra idle time so players have time to react before it retreats.
   const idleDuration = random(1400, 2200);
 
-  // Map the hole (normalized to the SVG viewBox) straight onto the screen.
-  const holeX = spawn.x * width;
+  // Hole center (detected in SVG space) mapped onto the framed screen.
+  const holeX = artToScreenX(spawn.x) * width;
   const holeY = spawn.y * height;
 
-  // Side holes slide inward toward the screen center so they clear the trunk;
-  // bottom holes grow straight out of the middle of their hole, no drift.
-  const isBottom = spawn.y > 0.7;
-  const dx = isBottom ? 0 : width / 2 - holeX;
-  const dy = isBottom ? 0 : height / 2 - holeY;
-  const len = Math.hypot(dx, dy) || 1;
-  const popDist = isBottom ? 0 : h * 0.35;
+  // Emergence axis: side holes slide horizontally inward, bottom holes rise
+  // straight up, so every character stays centered on its knot.
+  const fromBottom = spawn.y > 0.7;
+  const dirX = fromBottom ? 0 : Math.sign(width / 2 - holeX) || 1;
+  const dirY = fromBottom ? -1 : 0;
+  const popDist = h * 0.55;
 
   // Keep the whole character on screen. Side holes draw it rotated, so there
   // the on-screen box is h wide by w tall instead of w by h.
-  const rotation = holeRotation(spawn.x);
+  const rotation = holeRotation(spawn);
   const sideways = Math.abs(rotation) > 0.1;
   const boxW = sideways ? h : w;
   const boxH = sideways ? w : h;
   const margin = 6;
   const halfW = boxW / 2 + margin;
   const halfH = boxH / 2 + margin;
-  const targetX = constrain(holeX + (dx / len) * popDist, halfW, width - halfW);
-  const targetY = constrain(holeY + (dy / len) * popDist, halfH, height - halfH);
+
+  // Slide just far enough for the whole character to clear the trunk layer.
+  const clear = frontClearDistance(holeX, holeY, dirX, dirY, width * 0.5);
+  const pop = clear === null ? popDist : clear + (fromBottom ? halfH : halfW) + 10;
+
+  const targetX = constrain(holeX + dirX * pop, halfW, width - halfW);
+  const targetY = constrain(holeY + dirY * pop, halfH, height - halfH);
 
   arr.push({
     type, // random character
@@ -1125,9 +1484,10 @@ function munecoPose(m) {
   let scale, x, y;
 
   if (age < out) {
-    // Coming out of the hole.
+    // Coming out of the hole: grows and slides forward smoothly, so the
+    // character is clearly seen leaving the knot.
     const t = constrain(age / out, 0, 1);
-    const e = easeOutBack(t);
+    const e = easeOutCubic(t);
     scale = e;
     x = lerp(m.startX, m.targetX, e);
     y = lerp(m.startY, m.targetY, e);
