@@ -8,6 +8,13 @@
 const SCORE_THRESHOLD = 0.3; // minimum confidence for a body keypoint
 const WRIST_MIN_CONFIDENCE = 0.18; // hands are tracked even in low-confidence poses
 
+// Only two players are tracked at a time. MoveNet returns an unordered list of
+// people, so without this a third person walking in could take a player's place
+// between two detections. The two known players keep their slot until they
+// leave, and everyone else is ignored (no skeleton, no glove, no score).
+const MAX_PLAYERS = 2;
+const PLAYER_SLOT_MS = 10000; // a slot is freed after this long without seeing it
+
 const CAM_W = 1280;
 const CAM_H = 720;
 
@@ -16,6 +23,10 @@ let bodyPose;
 
 let poses = [];
 let handStates = []; // smoothed per-wrist data computed once per frame
+
+// The two tracked player slots: { x, y, at, pose }. Kept between detections so
+// each player keeps their identity (and their smoothing) while they are seen.
+let playerSlots = [];
 
 let bodyConnections = [];
 
@@ -63,6 +74,11 @@ const wristMotion = {}; // last screen position / velocity per wrist
 let munecos = [];
 let nextSpawnAt = 0;
 
+// Spawn balance: the left and right of the scene must show the same amount of
+// characters, so every spawn goes to the side with fewer so far.
+const spawnCount = { L: 0, R: 0 };
+const bgSpawnCount = { L: 0, R: 0 };
+
 // Non-interactive characters that keep popping in and out behind the start
 // screen, so the menu always feels alive.
 let bgMunecos = [];
@@ -79,8 +95,8 @@ const UI_FONT = "Mochiy Pop One";
 
 // --- Game state and music -------------------------------------------------
 
-// "start" shows the menu, "roulette" spins the music pick, "playing" runs the
-// match and "over" shows the final screen.
+// "start" shows the menu, "playing" runs the match and "over" shows the final
+// screen.
 let gameState = "start";
 
 // 30 seconds per match; the end screen returns to the menu by itself.
@@ -89,20 +105,9 @@ let matchEndAt = 0;
 const END_SCREEN_MS = 5000;
 let endScreenAt = 0;
 
-// One fist from each player must be held up before the match starts.
-const START_HOLD_MS = 700;
-let startHoldMs = 0;
-let startGate = { left: 0, right: 0, ready: false, progress: 0 };
-
-// Music roulette: after the fist gate the glow hops between the three tracks
-// with slowing steps and lands on a random winner.
-const ROULETTE_STEPS = 14;
-let rouletteStartAt = 0;
-let rouletteStep = 0;
-let rouletteIndex = 0;
-let rouletteWinner = 0;
-let rouletteLandedAt = 0;
-let rouletteSchedule = [];
+// One fist from each player starts the match the instant both are detected:
+// no hold timer and no countdown.
+let startGate = { left: 0, right: 0, ready: false };
 
 // Three background tracks by AudioCoffee (CC BY-NC 4.0). The first one is also
 // the default src in index.html so it preloads with the page.
@@ -244,6 +249,12 @@ function windowResized() {
 function initCamera() {
   if (bodyStarted) { bodyPose.detectStop(); bodyStarted = false; }
   videoReady = false;
+
+  // A new camera starts with no locked players.
+  playerSlots = [];
+  poses = [];
+  handStates = [];
+
   if (video) {
     if (video.elt && video.elt.srcObject) {
       video.elt.srcObject.getTracks().forEach((t) => t.stop());
@@ -475,13 +486,118 @@ function tryStartBody() {
 }
 
 function gotPoses(results) {
-  poses = (results || []).slice(0, 2); // first two people only
-  for (const pose of poses) {
+  const detections = [];
+
+  for (const pose of results || []) {
+    // Map MoveNet's camera-space keypoints into screen space.
     for (const kp of pose.keypoints) {
       kp.x = kp.x * coverScale + coverOffX;
       kp.y = kp.y * coverScale + coverOffY;
     }
+    const center = torsoCenter(pose);
+    if (center) detections.push({ pose, center });
   }
+
+  poses = lockPlayers(detections);
+}
+
+// Center of a person in screen space: shoulders and hips when visible, wrists
+// as a fallback for a close-up player.
+function torsoCenter(pose) {
+  let sx = 0;
+  let sy = 0;
+  let n = 0;
+
+  for (const kp of pose.keypoints) {
+    if (!/(shoulder|hip)/.test(kp.name)) continue;
+    if (kpConfidence(kp) <= SCORE_THRESHOLD) continue;
+    sx += kp.x;
+    sy += kp.y;
+    n++;
+  }
+
+  if (!n) {
+    for (const kp of pose.keypoints) {
+      if (!kp.name.endsWith("_wrist")) continue;
+      if (kpConfidence(kp) <= WRIST_MIN_CONFIDENCE) continue;
+      sx += kp.x;
+      sy += kp.y;
+      n++;
+    }
+  }
+
+  return n ? { x: sx / n, y: sy / n } : null;
+}
+
+// How far a person may move between two detections and still keep their slot.
+function playerMatchRadius() {
+  return Math.max(160, width * 0.2);
+}
+
+// Assigns the detections to the two player slots and returns at most two poses.
+// Any extra person in the frame is dropped here, so they never get a skeleton,
+// a glove or a point.
+function lockPlayers(detections) {
+  const now = millis();
+  const radius = playerMatchRadius();
+
+  // Forget players that have been out of view for a while, and clear last
+  // frame's pose so an unmatched slot draws nothing.
+  playerSlots = playerSlots.filter((slot) => now - slot.at <= PLAYER_SLOT_MS);
+  for (const slot of playerSlots) slot.pose = null;
+
+  // Greedy nearest matching: every detection claims the closest free slot.
+  const pairs = [];
+  for (let d = 0; d < detections.length; d++) {
+    for (let s = 0; s < playerSlots.length; s++) {
+      pairs.push({
+        d,
+        s,
+        dist: Math.hypot(
+          detections[d].center.x - playerSlots[s].x,
+          detections[d].center.y - playerSlots[s].y
+        ),
+      });
+    }
+  }
+  pairs.sort((a, b) => a.dist - b.dist);
+
+  const usedDetections = new Set();
+  const usedSlots = new Set();
+  for (const pair of pairs) {
+    if (pair.dist > radius) break;
+    if (usedDetections.has(pair.d) || usedSlots.has(pair.s)) continue;
+    usedDetections.add(pair.d);
+    usedSlots.add(pair.s);
+
+    const slot = playerSlots[pair.s];
+    slot.pose = detections[pair.d].pose;
+    slot.x = detections[pair.d].center.x;
+    slot.y = detections[pair.d].center.y;
+    slot.at = now;
+  }
+
+  // Unmatched people can only take an empty slot, never an occupied one. That
+  // is what makes a third person invisible to the game.
+  for (let d = 0; d < detections.length && playerSlots.length < MAX_PLAYERS; d++) {
+    if (usedDetections.has(d)) continue;
+    playerSlots.push({
+      x: detections[d].center.x,
+      y: detections[d].center.y,
+      at: now,
+      pose: detections[d].pose,
+    });
+  }
+
+  // The slot index stays stable while a player is tracked, so their body
+  // smoothing is never mixed with someone else's.
+  const tracked = [];
+  playerSlots.forEach((slot, i) => {
+    if (!slot.pose) return;
+    slot.pose.slot = i;
+    tracked.push(slot.pose);
+  });
+  return tracked;
 }
 
 // --- Main loop ------------------------------------------------------------
@@ -611,12 +727,10 @@ function drawStartScreen() {
 
   const layout = startLayout();
 
-  if (gameState === "roulette") {
-    updateRoulette();
-    if (gameState !== "roulette") return; // landed: the match already began
-  } else {
-    updateStartGate();
-  }
+  // Starts the match on the very frame both fists are seen, so nothing from
+  // the menu is drawn over the new match.
+  updateStartGate();
+  if (gameState !== "start") return;
 
   drawStartTitle(layout);
 
@@ -630,33 +744,21 @@ function drawStartScreen() {
   } else {
     drawCameraStatus(layout.dotsY);
   }
-
-  drawTrackPicker(layout);
 }
 
-// Vertical rhythm of the menu: the same breathing room between the title, the
-// instructions and the music label, derived from the text sizes.
+// Vertical rhythm of the menu: the same breathing room between the title and
+// the two instruction lines, derived from the text sizes.
 function startLayout() {
   const lineSize = Math.max(12, width * 0.023);
-  const labelSize = Math.max(10, width * 0.016);
   const titleSize = Math.max(42, width * 0.112);
 
   const blockGap = Math.max(26, height * 0.055);
 
-  const titleY = height * 0.205;
+  const titleY = height * 0.3;
   const titleBottom = titleY + titleSize * 0.78;
   const line1Y = titleBottom + blockGap + lineSize * 0.5;
   const line2Y = line1Y + lineSize * 1.55;
   const dotsY = line2Y + lineSize * 1.55;
-  const labelY = dotsY + blockGap + labelSize * 0.5;
-
-  const ph = Math.max(34, Math.min(height * 0.052, 58));
-  const gap = ph * 0.32;
-  const pw = Math.min(width * 0.56, 460);
-  const total = ph * 3 + gap * 2;
-  let y0 = labelY + labelSize * 0.5 + blockGap * 0.55;
-  y0 = Math.min(y0, height - total - 20);
-  const pills = TRACKS.map((_, i) => ({ x: (width - pw) / 2, y: y0 + i * (ph + gap), w: pw, h: ph }));
 
   return {
     titleSize,
@@ -665,9 +767,6 @@ function startLayout() {
     line1Y,
     line2Y,
     dotsY,
-    labelSize,
-    labelY: Math.min(labelY, y0 - labelSize * 1.2),
-    pills,
   };
 }
 
@@ -772,25 +871,16 @@ function drawMenuText(str, x, y, size, rgb) {
   pop();
 }
 
-// Reads the tracked wrists and decides when both players have a fist up.
+// Reads the tracked wrists and starts the match on the very first frame both
+// players have a fist up. There is no hold timer and no countdown screen.
 function updateStartGate() {
-  const up = handStates.filter((hs) => hs.raised);
+  const up = handStates.filter((hs) => hs.raised && hs.live !== false);
   const left = up.filter((hs) => hs.side === "L").length;
   const right = up.filter((hs) => hs.side === "R").length;
   const ready = left >= 1 && right >= 1;
-  const dt = Math.min(deltaTime, 100);
 
-  if (ready) startHoldMs += dt;
-  else startHoldMs = Math.max(0, startHoldMs - dt * 2);
-
-  if (startHoldMs >= START_HOLD_MS) startRoulette();
-
-  startGate = {
-    left,
-    right,
-    ready,
-    progress: constrain(startHoldMs / START_HOLD_MS, 0, 1),
-  };
+  startGate = { left, right, ready };
+  if (ready) startMatch();
   return startGate;
 }
 
@@ -824,18 +914,6 @@ function drawFistDots(layout) {
       circle(xs[i], cy, r * 2);
     }
   }
-
-  // Fill bar while both fists are held.
-  if (startGate.progress > 0) {
-    const bw = gap + r * 3.4;
-    const bh = Math.max(4, height * 0.006);
-    const by = cy + r * 2.2;
-    noStroke();
-    fill(255, 245, 220, 50);
-    rect(cx - bw / 2, by, bw, bh, bh / 2);
-    fill(255, 226, 138, 240);
-    rect(cx - bw / 2, by, bw * startGate.progress, bh, bh / 2);
-  }
 }
 
 function drawCameraStatus(y) {
@@ -846,99 +924,12 @@ function drawCameraStatus(y) {
   drawMenuText(msg, width / 2, y, Math.max(10, width * 0.017), [255, 236, 200]);
 }
 
-function drawTrackPicker(layout) {
-  const spinning = gameState === "roulette";
-  const landed = spinning && rouletteStep >= rouletteSchedule.length;
-  const active = spinning ? rouletteIndex : -1;
-
-  let label = "LA MÚSICA SE ELIGE AL AZAR";
-  if (spinning) label = landed ? "¡MÚSICA ELEGIDA!" : "ELIGIENDO MÚSICA…";
-  drawMenuText(label, width / 2, layout.labelY, layout.labelSize, [255, 240, 205]);
-
-  for (let i = 0; i < layout.pills.length; i++) {
-    const r = layout.pills[i];
-    const isActive = i === active;
-    const isWinner = landed && i === rouletteWinner;
-
-    push();
-    strokeWeight(2);
-
-    if (isActive || isWinner) {
-      // Warm glow, pulsing while the roulette is still running.
-      if (drawingContext) {
-        const pulse = 0.5 + 0.5 * Math.sin(millis() / 85);
-        drawingContext.shadowBlur = isWinner ? 34 : 16 + pulse * 20;
-        drawingContext.shadowColor = "rgba(255, 205, 96, 0.95)";
-      }
-      fill(255, 211, 110, 245);
-      stroke(255, 252, 240, 240);
-    } else {
-      fill(20, 12, 20, 148);
-      stroke(255, 245, 220, 110);
-    }
-
-    rect(r.x, r.y, r.w, r.h, r.h / 2);
-    if (drawingContext) drawingContext.shadowBlur = 0;
-
-    noStroke();
-    if (isActive || isWinner) fill(43, 26, 16);
-    else fill(255, 245, 220);
-    textAlign(CENTER, CENTER);
-    textFont(UI_FONT);
-    textSize(Math.max(9, Math.min(r.h * 0.32, r.w * 0.082)));
-    text(TRACKS[i].name.toUpperCase(), r.x + r.w / 2, r.y + r.h / 2 + 1);
-    pop();
-  }
-}
-
-// Builds a random hop schedule that slows down towards the end and always
-// finishes on the pre-picked winner.
-function startRoulette() {
-  gameState = "roulette";
-  startHoldMs = 0;
-  rouletteWinner = Math.floor(random(TRACKS.length));
-  rouletteStep = 0;
-  rouletteIndex = 0;
-  rouletteLandedAt = 0;
-  rouletteStartAt = millis();
-  rouletteSchedule = [];
-
-  let t = 0;
-  let prev = 0;
-  for (let i = 0; i < ROULETTE_STEPS; i++) {
-    const k = i / (ROULETTE_STEPS - 1);
-    t += lerp(70, 330, k * k * k); // longer waits as it decelerates
-
-    let idx;
-    if (i === ROULETTE_STEPS - 1) {
-      idx = rouletteWinner;
-    } else {
-      idx = Math.floor(random(TRACKS.length));
-      // Never repeat the same pill twice in a row.
-      if (idx === prev) idx = (idx + 1 + Math.floor(random(TRACKS.length - 1))) % TRACKS.length;
-    }
-
-    prev = idx;
-    rouletteSchedule.push({ at: t, index: idx });
-  }
-}
-
-function updateRoulette() {
-  const now = millis();
-  const elapsed = now - rouletteStartAt;
-
-  while (rouletteStep < rouletteSchedule.length && elapsed >= rouletteSchedule[rouletteStep].at) {
-    rouletteIndex = rouletteSchedule[rouletteStep].index;
-    rouletteStep++;
-  }
-
-  if (rouletteStep >= rouletteSchedule.length) {
-    if (!rouletteLandedAt) rouletteLandedAt = now;
-    if (now - rouletteLandedAt >= 900) {
-      selectTrack(rouletteWinner);
-      beginMatch();
-    }
-  }
+// Picks one of the tracks at random and starts the match in the same frame.
+// The choice is never displayed: no label, no pills, no spin.
+function startMatch() {
+  if (gameState !== "start") return;
+  selectTrack(Math.floor(random(TRACKS.length)));
+  beginMatch();
 }
 
 function beginMatch() {
@@ -948,7 +939,14 @@ function beginMatch() {
   munecos.length = 0;
   effects.length = 0;
   bgMunecos.length = 0;
-  startHoldMs = 0;
+  startGate = { left: 0, right: 0, ready: false };
+
+  // Each match starts with the left/right spawn totals even again.
+  spawnCount.L = 0;
+  spawnCount.R = 0;
+  bgSpawnCount.L = 0;
+  bgSpawnCount.R = 0;
+
   for (const key in lastFistHitAt) delete lastFistHitAt[key];
   nextSpawnAt = millis() + 700;
   bgNextSpawnAt = millis() + 350;
@@ -972,7 +970,7 @@ function resetToStart() {
   munecos.length = 0;
   effects.length = 0;
   bgMunecos.length = 0;
-  startHoldMs = 0;
+  startGate = { left: 0, right: 0, ready: false };
   bgNextSpawnAt = millis() + 350;
   endScreenAt = 0;
 }
@@ -982,7 +980,7 @@ function resetToStart() {
 function initMusic() {
   bgmEl = document.getElementById("bgm");
 
-  // Warm the cache for the other tracks so the roulette winner starts fast.
+  // Warm the cache for the other tracks so the random pick starts fast.
   for (let i = 1; i < TRACKS.length; i++) {
     const a = new Audio();
     a.preload = "auto";
@@ -1086,7 +1084,8 @@ function drawTimer() {
 // --- Body (subtle skeleton, up to 2 people) -------------------------------
 
 function drawBodies() {
-  poses.forEach((pose, i) => drawPose(pose, i));
+  // pose.slot keeps body smoothing tied to the player, not to the array order.
+  poses.forEach((pose, i) => drawPose(pose, pose.slot === undefined ? i : pose.slot));
 }
 
 function drawPose(pose, index) {
@@ -1380,8 +1379,9 @@ function updateMunecos() {
   }
 
   if (now >= nextSpawnAt) {
-    spawnMuneco();
-    nextSpawnAt = now + randomSpawnDelay();
+    // If the side that needs the next character has no free hole, retry shortly
+    // instead of spawning on the other side and unbalancing the scene.
+    nextSpawnAt = spawnMuneco() ? now + randomSpawnDelay() : now + 200;
   }
 }
 
@@ -1405,18 +1405,40 @@ function updateBgMunecos() {
   }
 
   if (now >= bgNextSpawnAt) {
-    spawnMuneco(bgMunecos);
-    bgNextSpawnAt = now + random(650, 1500);
+    bgNextSpawnAt = spawnMuneco(bgMunecos, bgSpawnCount)
+      ? now + random(650, 1500)
+      : now + 250;
   }
 }
 
-function spawnMuneco(arr = munecos) {
+// Which half of the scene a hole belongs to.
+function holeSide(hole) {
+  return hole.x < 0.5 ? "L" : "R";
+}
+
+// The side that needs the next character: always the one with fewer so far, so
+// both sides end up with the same amount.
+function balancedSide(counts) {
+  if (counts.L < counts.R) return "L";
+  if (counts.R < counts.L) return "R";
+  return random() < 0.5 ? "L" : "R";
+}
+
+function spawnMuneco(arr = munecos, counts = spawnCount) {
   // Only use a hole that isn't already occupied (avoids overlapping designs).
   const used = new Set(arr.map((m) => m.hole));
   const free = MUNECO_HOLES.map((_, i) => i).filter((i) => !used.has(i));
-  if (free.length === 0) return;
+  if (free.length === 0) return false;
 
-  const hole = free[Math.floor(random(free.length))];
+  // Pick the balanced side first and then one of its free holes. When that side
+  // is full the spawn waits, keeping the left/right counts even.
+  const side = balancedSide(counts);
+  const candidates = free.filter((i) => holeSide(MUNECO_HOLES[i]) === side);
+  if (candidates.length === 0) return false;
+
+  const hole = candidates[Math.floor(random(candidates.length))];
+  counts[side]++;
+
   const spawn = MUNECO_HOLES[hole];
   const type = Math.floor(random(CHAR_FILES.length));
   const h = height * random(0.16, 0.21); // character height (~16-21% of screen)
@@ -1468,6 +1490,7 @@ function spawnMuneco(arr = munecos) {
     lifetime: popDuration * 2 + idleDuration,
     age: 0,
   });
+  return true;
 }
 
 function drawMunecos() {
